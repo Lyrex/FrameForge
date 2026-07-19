@@ -2,6 +2,8 @@ use regex::Regex;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct ParsedReward {
@@ -96,7 +98,35 @@ impl LogParser {
 
 pub fn get_default_log_path() -> Option<String> {
     dirs::data_local_dir()
-        .map(|d| d.join("Warframe").join("EE.log"))
+        .map(|data_dir| {
+            #[cfg(target_os = "linux")]
+            {
+                linux_log_path(&data_dir)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                data_dir.join("Warframe").join("EE.log")
+            }
+        })
         .filter(|p| p.exists())
         .map(|p| p.to_string_lossy().to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_log_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("Steam/steamapps/compatdata/230410/pfx/drive_c/users/steamuser/AppData/Local/Warframe/EE.log")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn builds_proton_log_path_from_linux_data_dir() {
+        let path = linux_log_path(Path::new("/home/player/.local/share"));
+        assert_eq!(
+            path,
+            Path::new("/home/player/.local/share/Steam/steamapps/compatdata/230410/pfx/drive_c/users/steamuser/AppData/Local/Warframe/EE.log")
+        );
+    }
 }

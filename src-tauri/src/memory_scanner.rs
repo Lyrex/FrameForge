@@ -1,5 +1,9 @@
 ﻿use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::FileExt;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ModCount {
@@ -298,8 +302,78 @@ pub fn scan_steam_id(data: &[u8]) -> Option<String> {
 #[cfg(target_os = "windows")]
 pub fn find_warframe_pid_pub() -> Option<u32> { find_warframe_pid() }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+pub fn find_warframe_pid_pub() -> Option<u32> { find_warframe_pid() }
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub fn find_warframe_pid_pub() -> Option<u32> { None }
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+struct LinuxRegion {
+    start: usize,
+    len: usize,
+    executable: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_maps(maps: &str) -> Vec<LinuxRegion> {
+    maps.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let (start, end) = fields.next()?.split_once('-')?;
+            let permissions = fields.next()?;
+            if !permissions.starts_with('r') {
+                return None;
+            }
+            let start = usize::from_str_radix(start, 16).ok()?;
+            let end = usize::from_str_radix(end, 16).ok()?;
+            Some(LinuxRegion {
+                start,
+                len: end.checked_sub(start)?,
+                executable: permissions.as_bytes().get(2) == Some(&b'x'),
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+fn linux_process_regions(pid: u32) -> Result<Vec<LinuxRegion>, String> {
+    let path = format!("/proc/{pid}/maps");
+    std::fs::read_to_string(&path)
+        .map(|maps| parse_linux_maps(&maps))
+        .map_err(|error| format!("Failed to read {path}: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+fn open_linux_process_memory(pid: u32) -> Result<File, String> {
+    let path = format!("/proc/{pid}/mem");
+    File::open(&path).map_err(|error| {
+        format!(
+            "Failed to open {path}: {error}. Ensure kernel.yama.ptrace_scope permits same-user process access"
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+fn read_linux_process_memory(
+    memory: &File,
+    address: usize,
+    buffer: &mut [u8],
+) -> std::io::Result<usize> {
+    memory.read_at(buffer, address as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn is_warframe_command(command: &str) -> bool {
+    let command = command.to_ascii_lowercase();
+    command.contains("warframe.x64.exe")
+        && !command.contains("launcher.exe")
+        && !command.contains("warframe-companion")
+}
 
 // ─── Raw memory format probe ──────────────────────────────────────────────────
 //
@@ -1469,6 +1543,18 @@ pub fn find_riven_validity_va(pid: u32) -> Option<usize> {
 #[cfg(not(target_os = "windows"))]
 pub fn find_riven_validity_va(_pid: u32) -> Option<usize> { None }
 
+#[cfg(target_os = "linux")]
+fn find_warframe_pid() -> Option<u32> {
+    std::fs::read_dir("/proc")
+        .ok()?
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse().ok()?;
+            let command = std::fs::read(entry.path().join("cmdline")).ok()?;
+            is_warframe_command(&String::from_utf8_lossy(&command)).then_some(pid)
+        })
+}
+
 #[cfg(target_os = "windows")]
 fn find_warframe_pid() -> Option<u32> {
     use std::mem;
@@ -1555,5 +1641,41 @@ mod seed_tests {
         let buf = b"x\"SubscribedToEmails\":1}";
         let (marker_off, json_open) = blob_seed_offsets(buf);
         assert_eq!(json_open, marker_off);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn parses_only_readable_linux_mappings() {
+        let maps = "1000-2000 r--p 0 00:00 0\n2000-2800 --xp 0 00:00 0\n3000-5000 rw-p 0 00:00 0\n";
+        assert_eq!(
+            parse_linux_maps(maps),
+            vec![
+                LinuxRegion {
+                    start: 0x1000,
+                    len: 0x1000,
+                    executable: false,
+                },
+                LinuxRegion {
+                    start: 0x3000,
+                    len: 0x2000,
+                    executable: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn recognizes_warframe_but_not_launcher_processes() {
+        assert!(is_warframe_command(
+            "Z:\\Warframe\\Warframe.x64.exe -cluster:public"
+        ));
+        assert!(!is_warframe_command(
+            "Z:\\Warframe\\Tools\\Launcher.exe"
+        ));
+        assert!(!is_warframe_command("warframe-companion"));
     }
 }
