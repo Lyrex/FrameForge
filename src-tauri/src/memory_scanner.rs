@@ -317,6 +317,22 @@ struct LinuxRegion {
 }
 
 #[cfg(target_os = "linux")]
+struct LinuxProcess {
+    memory: File,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxProcess {
+    fn open(pid: u32) -> Result<Self, String> {
+        open_linux_process_memory(pid).map(|memory| Self { memory })
+    }
+
+    fn read(&self, address: usize, buffer: &mut [u8]) -> std::io::Result<usize> {
+        read_linux_process_memory(&self.memory, address, buffer)
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn parse_linux_maps(maps: &str) -> Vec<LinuxRegion> {
     maps.lines()
         .filter_map(|line| {
@@ -338,16 +354,18 @@ fn parse_linux_maps(maps: &str) -> Vec<LinuxRegion> {
 }
 
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 fn linux_process_regions(pid: u32) -> Result<Vec<LinuxRegion>, String> {
     let path = format!("/proc/{pid}/maps");
     std::fs::read_to_string(&path)
         .map(|maps| parse_linux_maps(&maps))
-        .map_err(|error| format!("Failed to read {path}: {error}"))
+        .map_err(|error| {
+            format!(
+                "Failed to read {path}: {error}. Ensure kernel.yama.ptrace_scope permits same-user process access"
+            )
+        })
 }
 
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 fn open_linux_process_memory(pid: u32) -> Result<File, String> {
     let path = format!("/proc/{pid}/mem");
     File::open(&path).map_err(|error| {
@@ -358,13 +376,75 @@ fn open_linux_process_memory(pid: u32) -> Result<File, String> {
 }
 
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 fn read_linux_process_memory(
     memory: &File,
     address: usize,
     buffer: &mut [u8],
 ) -> std::io::Result<usize> {
     memory.read_at(buffer, address as u64)
+}
+
+#[cfg(target_os = "windows")]
+pub fn scan_warframe_credentials_process() -> Result<(String, String, String), String> {
+    use std::ffi::c_void;
+    use std::mem;
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::{
+            Diagnostics::Debug::ReadProcessMemory,
+            Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS},
+            Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
+        },
+    };
+
+    let pid = find_warframe_pid_pub().ok_or("Warframe is not running")?;
+
+    unsafe {
+        let process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, 0, pid);
+        if process == 0 { return Err("Cannot open Warframe process".into()); }
+
+        let mut address: usize = 0x10000;
+        let mbi_size = mem::size_of::<MEMORY_BASIC_INFORMATION>();
+
+        loop {
+            let mut mbi: MEMORY_BASIC_INFORMATION = mem::zeroed();
+            if VirtualQueryEx(process, address as *const c_void, &mut mbi, mbi_size) == 0 { break; }
+            let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+            if region_end <= address { break; }
+            address = region_end;
+
+            if mbi.State != MEM_COMMIT { continue; }
+            let protection = mbi.Protect;
+            if protection & PAGE_NOACCESS != 0 || protection & PAGE_GUARD != 0 { continue; }
+            if protection == 0x10 || protection == 0x20 { continue; }
+            if mbi.RegionSize > 128 * 1024 * 1024 { continue; }
+
+            let mut buffer = vec![0u8; mbi.RegionSize];
+            let mut bytes_read: usize = 0;
+            let ok = ReadProcessMemory(
+                process,
+                mbi.BaseAddress as *const c_void,
+                buffer.as_mut_ptr() as *mut c_void,
+                mbi.RegionSize,
+                &mut bytes_read,
+            );
+            if ok == 0 || bytes_read == 0 { continue; }
+
+            let data = &buffer[..bytes_read];
+            if let Some((id, nonce)) = scan_auth_credentials(data) {
+                let steam_id = scan_steam_id(data).unwrap_or_default();
+                CloseHandle(process);
+                return Ok((id, nonce, steam_id));
+            }
+        }
+        CloseHandle(process);
+    }
+    Err("Credentials not found in memory. Make sure you are in the orbiter (not loading screen) and Warframe has been running for a few minutes.".into())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn scan_warframe_credentials_process() -> Result<(String, String, String), String> {
+    Err("Only supported on Windows".into())
 }
 
 #[cfg(target_os = "linux")]
@@ -1341,7 +1421,223 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
     saved
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+fn scan_linux_inventory_regions(
+    process: &LinuxProcess,
+    regions: impl IntoIterator<Item = LinuxRegion>,
+    mut on_blob: impl FnMut(usize, &[u8], BlobInventory) -> bool,
+) {
+    const MIN_REGION: usize = 64_000;
+    const MAX_READ: usize = 64 * 1024 * 1024;
+    const MAX_SCAN: usize = 20 * 1024 * 1024;
+    const START_MARKER: &[u8] = b"\"SubscribedToEmails\"";
+    const END_MARKER: &[u8] = b"\"DeathSquadable\":";
+    const MISSION_DELTA: &[u8] = b"\"InventoryChanges\":";
+    const PREFIX_MARKERS: &[&[u8]] = &[
+        b"/Lotus/",
+        b"\"MiscItems\":[",
+        b"\"Suits\":[",
+        b"\"LongGuns\":[",
+        b"\"Melee\":[",
+        b"\"Pistols\":[",
+    ];
+    const PREFIX_BYTES: usize = 8 * 1024 * 1024;
+
+    struct ActiveScan {
+        data: Vec<u8>,
+        start_address: usize,
+        search_from: usize,
+    }
+
+    struct PrefixChunk {
+        start: usize,
+        end: usize,
+        data: Vec<u8>,
+    }
+
+    let mut scans: Vec<ActiveScan> = Vec::new();
+    let mut prefix = std::collections::VecDeque::<PrefixChunk>::new();
+    for region in regions {
+        if region.executable || region.len < MIN_REGION {
+            continue;
+        }
+
+        let mut buffer = vec![0; region.len.min(MAX_READ)];
+        let read = match process.read(region.start, &mut buffer) {
+            Ok(read) if read >= 8 => read,
+            Ok(_) | Err(_) => continue,
+        };
+        let chunk = &buffer[..read];
+
+        let mut index = 0;
+        while index < scans.len() {
+            let search_from = scans[index].search_from;
+            scans[index].search_from = scans[index].data.len().saturating_sub(END_MARKER.len() - 1);
+            scans[index].data.extend_from_slice(chunk);
+
+            if scans[index].data.len() > MAX_SCAN {
+                scans.swap_remove(index);
+                continue;
+            }
+
+            let complete = scans[index].data[search_from..]
+                .windows(END_MARKER.len())
+                .any(|window| window == END_MARKER)
+                && find_blob_end(&scans[index].data).is_some();
+            if !complete {
+                index += 1;
+                continue;
+            }
+
+            let scan = scans.swap_remove(index);
+            if let Some(inventory) = parse_full_account_blob(&scan.data) {
+                if !on_blob(scan.start_address, &scan.data, inventory) {
+                    return;
+                }
+            }
+        }
+
+        let is_mission = chunk
+            .windows(MISSION_DELTA.len())
+            .any(|window| window == MISSION_DELTA);
+        let start_offset = chunk
+            .windows(START_MARKER.len())
+            .position(|window| window == START_MARKER);
+        let has_prefix = PREFIX_MARKERS
+            .iter()
+            .any(|marker| chunk.windows(marker.len()).any(|window| window == *marker));
+        if start_offset.is_none() && !is_mission && has_prefix {
+            while prefix.iter().map(|item| item.data.len()).sum::<usize>() + read > PREFIX_BYTES
+                && !prefix.is_empty()
+            {
+                prefix.pop_front();
+            }
+            prefix.push_back(PrefixChunk {
+                start: region.start,
+                end: region.start + read,
+                data: chunk.to_vec(),
+            });
+        }
+        if is_mission {
+            continue;
+        }
+        let Some(_) = start_offset else {
+            continue;
+        };
+
+        let mut combined = Vec::new();
+        let mut combined_start = region.start;
+        let mut expected_end = region.start;
+        let mut chain = Vec::new();
+        for (index, item) in prefix.iter().enumerate().rev() {
+            if item.end <= expected_end && item.end + 4096 >= expected_end {
+                chain.push(index);
+                expected_end = item.start;
+            } else if item.end < expected_end.saturating_sub(4096) {
+                break;
+            }
+        }
+        chain.reverse();
+        for index in chain {
+            let item = &prefix[index];
+            if combined.is_empty() {
+                combined_start = item.start;
+            }
+            combined.extend_from_slice(&item.data);
+        }
+        combined.extend_from_slice(chunk);
+
+        let start_offset = combined
+            .windows(START_MARKER.len())
+            .position(|window| window == START_MARKER)
+            .expect("combined data retains the start marker");
+        let json_open = combined[..start_offset + 1]
+            .windows(2)
+            .position(|window| window == b"{\"")
+            .unwrap_or(start_offset);
+        let start_address = combined_start + json_open;
+        let seed = combined[json_open..].to_vec();
+
+        if find_blob_end(&seed).is_some() {
+            if let Some(inventory) = parse_full_account_blob(&seed) {
+                if !on_blob(start_address, &seed, inventory) {
+                    return;
+                }
+            }
+        } else {
+            scans.push(ActiveScan {
+                data: seed,
+                start_address,
+                search_from: 0,
+            });
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn capture_all_blobs(
+    blob_dir: &std::path::Path,
+    ts: &str,
+    blob_tx: std::sync::mpsc::Sender<BlobInventory>,
+    save: bool,
+) -> usize {
+    const MAX_BLOBS: usize = 25;
+
+    let Some(pid) = find_warframe_pid_pub() else {
+        eprintln!("[blob-capture] Warframe is not running");
+        return 0;
+    };
+    let process = match LinuxProcess::open(pid) {
+        Ok(process) => process,
+        Err(error) => {
+            eprintln!("[blob-capture] {error}");
+            return 0;
+        }
+    };
+    let regions = match linux_process_regions(pid) {
+        Ok(regions) => regions,
+        Err(error) => {
+            eprintln!("[blob-capture] {error}");
+            return 0;
+        }
+    };
+
+    let mut found = 0;
+    let mut saved = 0;
+    scan_linux_inventory_regions(&process, regions, |address, raw, inventory| {
+        found += 1;
+        eprintln!(
+            "[blob] Linux scan SUCCESS at 0x{address:012x}: {} unique, {} stackable, {} mods",
+            inventory.unique_items.len(),
+            inventory.stackable_items.len(),
+            inventory.mods.len()
+        );
+        if save {
+            let path = blob_dir.join(format!(
+                "Actual_inventory_FULL_ACCOUNT_{}_{:02}.txt",
+                ts,
+                saved + 1
+            ));
+            match std::fs::write(&path, raw) {
+                Ok(()) => saved += 1,
+                Err(error) => {
+                    eprintln!("[blob-capture] Failed to write {}: {error}", path.display())
+                }
+            }
+        }
+        blob_tx.send(inventory).ok();
+        save && found < MAX_BLOBS
+    });
+
+    if found == 0 {
+        eprintln!(
+            "[blob-capture] WARNING: no FULL_ACCOUNT blob found (open Arsenal or Inventory and try again)"
+        );
+    }
+    saved
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub fn capture_all_blobs(_blob_dir: &std::path::Path, _ts: &str, _blob_tx: std::sync::mpsc::Sender<BlobInventory>, _save: bool) -> usize { 0 }
 
 // ─── Continuous raw memory string dump ───────────────────────────────────────
@@ -1647,6 +1943,90 @@ mod seed_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod linux_tests {
     use super::*;
+
+    #[test]
+    fn credential_process_scan_is_unsupported() {
+        assert_eq!(
+            scan_warframe_credentials_process(),
+            Err("Only supported on Windows".to_string())
+        );
+    }
+
+    #[test]
+    fn linux_reader_reads_its_own_mapping() {
+        let marker = b"frameforge-linux-reader";
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+        let mut actual = vec![0; marker.len()];
+        let read = process
+            .read(marker.as_ptr() as usize, &mut actual)
+            .expect("marker address is mapped");
+        assert_eq!(read, marker.len());
+        assert_eq!(actual, marker);
+    }
+
+    #[test]
+    fn linux_inventory_scan_stitches_and_parses_regions() {
+        let first_json = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#;
+        let second_json = br#""DeathSquadable":false}"#;
+        let mut first = first_json.to_vec();
+        first.resize(64_000, b' ');
+        let mut second = second_json.to_vec();
+        second.resize(64_000, 0);
+        let regions = vec![
+            LinuxRegion {
+                start: first.as_ptr() as usize,
+                len: first.len(),
+                executable: false,
+            },
+            LinuxRegion {
+                start: second.as_ptr() as usize,
+                len: second.len(),
+                executable: false,
+            },
+        ];
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+        let mut inventory = None;
+
+        scan_linux_inventory_regions(&process, regions, |_, _, parsed| {
+            inventory = Some(parsed);
+            false
+        });
+
+        assert_eq!(inventory.expect("inventory blob is found").credits, 42);
+    }
+
+    #[test]
+    fn linux_inventory_scan_recovers_fields_before_start_marker() {
+        let prefix =
+            br#"{"RegularCredits":42,"MiscItems":[{"ItemType":"/Lotus/Test","ItemCount":1}],"#;
+        let suffix = br#""SubscribedToEmails":true,"DeathSquadable":false}"#;
+        let mut mapping = vec![b' '; 128_000];
+        mapping[..prefix.len()].copy_from_slice(prefix);
+        mapping[64_000..64_000 + suffix.len()].copy_from_slice(suffix);
+        let regions = vec![
+            LinuxRegion {
+                start: mapping.as_ptr() as usize,
+                len: 64_000,
+                executable: false,
+            },
+            LinuxRegion {
+                start: mapping.as_ptr() as usize + 64_000,
+                len: 64_000,
+                executable: false,
+            },
+        ];
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+        let mut inventory = None;
+
+        scan_linux_inventory_regions(&process, regions, |_, _, parsed| {
+            inventory = Some(parsed);
+            false
+        });
+
+        let inventory = inventory.expect("inventory blob is found");
+        assert_eq!(inventory.credits, 42);
+        assert_eq!(inventory.stackable_items.len(), 1);
+    }
 
     #[test]
     fn parses_only_readable_linux_mappings() {
