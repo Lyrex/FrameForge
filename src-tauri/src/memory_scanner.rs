@@ -1629,6 +1629,76 @@ fn scan_linux_inventory_regions(
     }
 }
 
+/// Re-read the blob straight from the address the last successful scan found it
+/// at, stitching forward through following mappings until the JSON closes.
+///
+/// The full walk reads several gigabytes to reach a blob that, in practice,
+/// sits near the very top of the address space — the last few percent of the
+/// mappings. Because the monitor rescans every 10 seconds and the game rarely
+/// moves the allocation between them, probing the remembered address first
+/// turns the common case into a few megabytes of reads.
+///
+/// Returns `None` whenever anything looks different from last time, which puts
+/// the caller back on the full walk rather than reporting a stale inventory.
+#[cfg(target_os = "linux")]
+fn scan_linux_cached_blob(
+    process: &LinuxProcess,
+    regions: &[LinuxRegion],
+) -> Option<(usize, Vec<u8>, BlobInventory)> {
+    const MAX_SCAN: usize = 20 * 1024 * 1024;
+    const START_MARKER: &[u8] = b"\"SubscribedToEmails\"";
+    const MISSION_DELTA: &[u8] = b"\"InventoryChanges\":";
+
+    let cached = LAST_BLOB_REGION.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    if cached == 0 {
+        return None;
+    }
+    let index = regions
+        .iter()
+        .position(|region| cached >= region.start && cached < region.start + region.len)?;
+
+    // The cached address is the blob's opening brace, so the seed starts there
+    // and runs to the end of its mapping.
+    let region = &regions[index];
+    let mut data = vec![0; region.start + region.len - cached];
+    let read = process.read(cached, &mut data).ok()?;
+    data.truncate(read);
+    // The walk seeds either from the blob's opening brace or, when the brace
+    // sits in an earlier mapping it could not stitch, from the start marker
+    // itself. Accept both shapes and reject anything else as a stale address.
+    if !data.starts_with(b"{\"") && !data.starts_with(START_MARKER) {
+        return None;
+    }
+    // A mission reward delta shares most of the blob's field names but describes
+    // a single mission, so treating one as the inventory would wipe the cache.
+    if AhoCorasick::new([MISSION_DELTA])
+        .expect("mission marker is a valid literal")
+        .is_match(&data[..])
+    {
+        return None;
+    }
+
+    // Continue through the following mappings exactly as the full walk does:
+    // the blob regularly spans several of them, and gaps between mappings do
+    // not interrupt the JSON.
+    let mut next = index + 1;
+    while find_blob_end(&data).is_none() {
+        if data.len() >= MAX_SCAN {
+            return None;
+        }
+        let region = regions.get(next)?;
+        next += 1;
+        if region.executable {
+            continue;
+        }
+        let mut buffer = vec![0; region.len.min(MAX_SCAN - data.len())];
+        let read = process.read(region.start, &mut buffer).ok()?;
+        data.extend_from_slice(&buffer[..read]);
+    }
+
+    parse_full_account_blob(&data).map(|inventory| (cached, data, inventory))
+}
+
 #[cfg(target_os = "linux")]
 pub fn capture_all_blobs(
     blob_dir: &std::path::Path,
@@ -1657,6 +1727,16 @@ pub fn capture_all_blobs(
         }
     };
 
+    // Saving blobs is a debugging path that wants every copy in memory, so it
+    // always takes the full walk.
+    if !save {
+        if let Some((address, _, inventory)) = scan_linux_cached_blob(&process, &regions) {
+            eprintln!("[blob] Linux cached-region hit at 0x{address:012x}");
+            blob_tx.send(inventory).ok();
+            return 0;
+        }
+    }
+
     let mut found = 0;
     let mut saved = 0;
     scan_linux_inventory_regions(&process, regions, |address, raw, inventory| {
@@ -1680,6 +1760,8 @@ pub fn capture_all_blobs(
                 }
             }
         }
+        // Remember where this blob started so the next cycle can skip the walk.
+        LAST_BLOB_REGION.store(address as u64, std::sync::atomic::Ordering::Relaxed);
         blob_tx.send(inventory).ok();
         save && found < MAX_BLOBS
     });
@@ -2009,6 +2091,33 @@ mod linux_tests {
             .expect("marker address is mapped");
         assert_eq!(read, marker.len());
         assert_eq!(actual, marker);
+    }
+
+    #[test]
+    fn linux_cached_blob_is_reread_and_rejected_when_stale() {
+        // Blobs under 50 KB are rejected as coincidental fragments, so the
+        // fixture pads the object out to a realistic size.
+        let mut data = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#.to_vec();
+        data.resize(64_000, b' ');
+        data.extend_from_slice(br#""DeathSquadable":false}"#);
+        data.resize(128_000, 0);
+        let regions = vec![LinuxRegion {
+            start: data.as_ptr() as usize,
+            len: data.len(),
+            executable: false,
+        }];
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+
+        LAST_BLOB_REGION.store(data.as_ptr() as u64, std::sync::atomic::Ordering::Relaxed);
+        let hit = scan_linux_cached_blob(&process, &regions);
+        assert_eq!(hit.expect("cached blob is re-read").2.credits, 42);
+
+        // An address that no longer starts a blob must fall back to the walk
+        // rather than reporting whatever happens to live there now.
+        LAST_BLOB_REGION.store(data.as_ptr() as u64 + 8, std::sync::atomic::Ordering::Relaxed);
+        assert!(scan_linux_cached_blob(&process, &regions).is_none());
+
+        reset_last_blob_region();
     }
 
     #[test]
