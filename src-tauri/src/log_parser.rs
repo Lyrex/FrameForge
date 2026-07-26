@@ -1,9 +1,7 @@
 use regex::Regex;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::Path;
-#[cfg(target_os = "linux")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct ParsedReward {
@@ -96,18 +94,26 @@ impl LogParser {
     }
 }
 
+/// Where EE.log lives, whether or not Warframe has written it yet.
+///
+/// The log watchers start before the game does, so they need the path even
+/// when the file is still absent; callers that require an existing file use
+/// [`get_default_log_path`] instead.
+pub fn default_log_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|data_dir| {
+        #[cfg(target_os = "linux")]
+        {
+            linux_log_path(&data_dir)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            data_dir.join("Warframe").join("EE.log")
+        }
+    })
+}
+
 pub fn get_default_log_path() -> Option<String> {
-    dirs::data_local_dir()
-        .map(|data_dir| {
-            #[cfg(target_os = "linux")]
-            {
-                linux_log_path(&data_dir)
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                data_dir.join("Warframe").join("EE.log")
-            }
-        })
+    default_log_path()
         .filter(|p| p.exists())
         .map(|p| p.to_string_lossy().to_string())
 }

@@ -18,6 +18,9 @@ use tauri::{Emitter, Manager, State};
 
 mod console_login; // [console-login feature] remove this line to drop the feature
 mod db;
+// EE.log lives at a different path per platform (Proton prefix on Linux), so
+// path construction lives here rather than being inlined at each watcher.
+mod log_parser;
 mod memory_scanner;
 mod ocr;
 mod wfcd;
@@ -561,64 +564,11 @@ async fn scan_warframe_credentials() -> Result<(String, String, String), String>
 }
 
 fn scan_warframe_credentials_sync() -> Result<(String, String, String), String> {
-    #[cfg(not(target_os = "windows"))]
-    { return Err("Only supported on Windows".into()); }
-    #[cfg(target_os = "windows")]
-    use windows_sys::Win32::{
-        Foundation::CloseHandle,
-        System::{
-            Diagnostics::Debug::ReadProcessMemory,
-            Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS},
-            Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
-        },
-    };
-    use std::ffi::c_void;
-    use std::mem;
-
-    let pid = memory_scanner::find_warframe_pid_pub()
-        .ok_or("Warframe is not running")?;
-
-    unsafe {
-        let process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, 0, pid);
-        if process == 0 { return Err("Cannot open Warframe process".into()); }
-
-        let mut address: usize = 0x10000;
-        let mbi_size = mem::size_of::<MEMORY_BASIC_INFORMATION>();
-
-        loop {
-            let mut mbi: MEMORY_BASIC_INFORMATION = mem::zeroed();
-            if VirtualQueryEx(process, address as *const c_void, &mut mbi, mbi_size) == 0 { break; }
-            let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
-            if region_end <= address { break; }
-            address = region_end;
-
-            if mbi.State != MEM_COMMIT { continue; }
-            let p = mbi.Protect;
-            if p & PAGE_NOACCESS != 0 || p & PAGE_GUARD != 0 { continue; }
-            if p == 0x10 || p == 0x20 { continue; }
-            if mbi.RegionSize > 128 * 1024 * 1024 { continue; }
-
-            let mut buffer = vec![0u8; mbi.RegionSize];
-            let mut bytes_read: usize = 0;
-            let ok = ReadProcessMemory(
-                process, mbi.BaseAddress as *const c_void,
-                buffer.as_mut_ptr() as *mut c_void, mbi.RegionSize, &mut bytes_read,
-            );
-            if ok == 0 || bytes_read == 0 { continue; }
-
-            if let Some((id, nonce)) = memory_scanner::scan_auth_credentials(&buffer[..bytes_read]) {
-                let steam_id = memory_scanner::scan_steam_id(&buffer[..bytes_read]).unwrap_or_default();
-                CloseHandle(process);
-                return Ok((id, nonce, steam_id));
-            }
-        }
-        CloseHandle(process);
-    }
-    Err("Credentials not found in memory. Make sure you are in the orbiter (not loading screen) and Warframe has been running for a few minutes.".into())
-
+    memory_scanner::scan_warframe_credentials_process()
 }
 
 /// Scan Warframe memory for API request URLs — reveals exact endpoints the game uses.
+#[cfg(target_os = "windows")]
 #[tauri::command]
 async fn scan_warframe_api_urls() -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(|| {
@@ -696,6 +646,12 @@ async fn scan_warframe_api_urls() -> Result<Vec<String>, String> {
         }
         Ok(found)
     }).await.map_err(|e| e.to_string())?
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+async fn scan_warframe_api_urls() -> Result<Vec<String>, String> {
+    Err("Only supported on Windows".into())
 }
 
 /// Persist mastery data (unique_name → rank 0-30) from the Companion API or any other source.
@@ -1823,6 +1779,36 @@ fn wfm_delete_credentials() -> Result<(), String> {
     Ok(())
 }
 
+// ==============================================================================
+// Non-Windows credential storage
+// ==============================================================================
+//
+// Persisting the WFM session needs an OS-encrypted store; only the Windows
+// Credential Manager is wired up. Rather than fall back to a plaintext file,
+// Linux refuses to save and reports "no saved session" on load, so the UI hides
+// the "stay logged in" controls and the user logs in each run.
+//
+// ponytail: no Linux keyring; add libsecret/DBus if session persistence is wanted.
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn wfm_save_credentials(email: String, password: String) -> Result<(), String> {
+    let _ = (email, password);
+    Err("Saving credentials is only supported on Windows".into())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn wfm_load_credentials() -> Result<Option<(String, String)>, String> {
+    Ok(None)
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn wfm_delete_credentials() -> Result<(), String> {
+    Ok(())
+}
+
 /// Clear the stored WFM session.
 #[tauri::command]
 fn wfm_logout(state: State<AppState>) {
@@ -2833,14 +2819,62 @@ fn parse_trade_dialog(raw: &str) -> Option<ParsedTrade> {
     })
 }
 
+// ==============================================================================
+// EE.log wake-up source
+// ==============================================================================
+//
+// Both log watchers want to react the instant Warframe flushes a line. Windows
+// gets that for free from FindFirstChangeNotificationW, which blocks until the
+// log directory is written. Linux has no equivalent wired up here, so it falls
+// back to polling at the caller's interval — a few extra wake-ups per second,
+// but the surrounding loop stays identical on both platforms.
+//
+// ponytail: polling on Linux; switch to inotify if wake-up latency matters.
+
+/// Open a directory-change notification for EE.log's folder, or `None` when the
+/// platform or the call cannot provide one (the caller then polls).
+#[cfg(target_os = "windows")]
+fn open_log_notifier(log_path: &std::path::Path) -> Option<isize> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FindFirstChangeNotificationW, FILE_NOTIFY_CHANGE_LAST_WRITE,
+    };
+    let dir = log_path.parent().unwrap_or(std::path::Path::new("."));
+    let dir_wide: Vec<u16> = dir.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+    let handle = unsafe { FindFirstChangeNotificationW(dir_wide.as_ptr(), 0, FILE_NOTIFY_CHANGE_LAST_WRITE) };
+    (handle != -1).then_some(handle) // -1 = INVALID_HANDLE_VALUE
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_log_notifier(_log_path: &std::path::Path) -> Option<isize> { None }
+
+/// Block until EE.log's directory is written, or until `poll` elapses when no
+/// notifier is available. The 500 ms notification timeout keeps loops that check
+/// a stop flag responsive even while the game is idle.
+#[cfg(target_os = "windows")]
+fn wait_for_log_change(notifier: Option<isize>, poll: std::time::Duration) {
+    use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    let Some(handle) = notifier else {
+        std::thread::sleep(poll);
+        return;
+    };
+    unsafe {
+        WaitForSingleObject(handle, 500);
+        FindNextChangeNotification(handle);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wait_for_log_change(_notifier: Option<isize>, poll: std::time::Duration) {
+    std::thread::sleep(poll);
+}
+
 /// Start a lightweight EE.log watcher for features that don't need the memory scanner:
 /// riven reroll detection, trade completion detection, WFM whisper detection.
 /// Called unconditionally at app startup — EE.log is plain file I/O, not memory reading.
 #[tauri::command]
 fn start_log_watcher(app: tauri::AppHandle) -> Result<(), String> {
-    let log_path = dirs::data_local_dir()
-        .map(|d| d.join("Warframe").join("EE.log"))
-        .ok_or("Cannot find LocalAppData")?;
+    let log_path = log_parser::default_log_path().ok_or("Cannot find the local data directory")?;
 
     std::thread::spawn(move || {
         use std::io::{Read, Seek, SeekFrom};
@@ -2850,28 +2884,12 @@ fn start_log_watcher(app: tauri::AppHandle) -> Result<(), String> {
         // Guards against the same EE.log buffer being processed twice by React StrictMode listeners.
         let mut last_riven_fire: Option<std::time::Instant> = None;
 
-        // Use FindFirstChangeNotificationW so we wake up the instant EE.log is written,
-        // instead of sleeping and polling. This is how Overwolf achieves low latency.
-        let change_handle: isize = {
-            use windows_sys::Win32::Storage::FileSystem::{
-                FindFirstChangeNotificationW, FILE_NOTIFY_CHANGE_LAST_WRITE,
-            };
-            let dir = log_path.parent().unwrap_or(std::path::Path::new("."));
-            let dir_wide: Vec<u16> = dir.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
-            unsafe { FindFirstChangeNotificationW(dir_wide.as_ptr(), 0, FILE_NOTIFY_CHANGE_LAST_WRITE) }
-        };
-        let use_notify = change_handle != -1; // -1 = INVALID_HANDLE_VALUE
+        // Wake up the instant EE.log is written instead of sleeping and polling.
+        // This is how Overwolf achieves low latency.
+        let notifier = open_log_notifier(&log_path);
 
         loop {
-            if use_notify {
-                use windows_sys::Win32::System::Threading::WaitForSingleObject;
-                use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
-                // Block until EE.log directory has a write — then process immediately
-                unsafe { WaitForSingleObject(change_handle, 500); } // 500ms safety timeout
-                unsafe { FindNextChangeNotification(change_handle); }
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            wait_for_log_change(notifier, std::time::Duration::from_millis(50));
             let Ok(mut f) = std::fs::File::open(&log_path) else { continue };
             let len = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
             if len < file_pos { file_pos = 0; }
@@ -4969,8 +4987,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
     // Void Fissure reward selection screen becomes active.  All open-source
     // tools (WFInfo, warframeocr, Sentinel) use this string as their trigger.
     // We tail the log file instead of relying on fragile OCR gate heuristics.
-    let ee_log_path = dirs::data_local_dir()
-        .map(|d| d.join("Warframe").join("EE.log"));
+    let ee_log_path = log_parser::default_log_path();
 
     // Shared flag: true while the reward screen is active according to EE.log
     let reward_screen_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -5095,31 +5112,13 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
             // Created at trigger, BMP written after overlay confirmed, session log at dismiss.
             let diag_arc: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::new(Mutex::new(None));
 
-            // Use FindFirstChangeNotificationW so we wake the instant EE.log is
-            // written to disk instead of sleeping 200 ms between checks.
-            let change_handle: isize = {
-                use windows_sys::Win32::Storage::FileSystem::{
-                    FindFirstChangeNotificationW, FILE_NOTIFY_CHANGE_LAST_WRITE,
-                };
-                let dir = log_path.parent().unwrap_or(std::path::Path::new("."));
-                let dir_wide: Vec<u16> = dir.to_string_lossy()
-                    .encode_utf16().chain(std::iter::once(0)).collect();
-                unsafe { FindFirstChangeNotificationW(dir_wide.as_ptr(), 0, FILE_NOTIFY_CHANGE_LAST_WRITE) }
-            };
-            let use_notify = change_handle != -1isize; // -1 = INVALID_HANDLE_VALUE
+            // Wake the instant EE.log is written to disk instead of sleeping
+            // 200 ms between checks.
+            let notifier = open_log_notifier(&log_path);
 
             loop {
                 if !flag.load(Ordering::SeqCst) { break; }
-                if use_notify {
-                    use windows_sys::Win32::System::Threading::WaitForSingleObject;
-                    use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
-                    // Block until a write lands in the EE.log directory (500 ms safety timeout
-                    // keeps the flag check alive even when the game isn't writing).
-                    unsafe { WaitForSingleObject(change_handle, 500); }
-                    unsafe { FindNextChangeNotification(change_handle); }
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
+                wait_for_log_change(notifier, std::time::Duration::from_millis(200));
                 let Ok(mut f) = std::fs::File::open(&log_path) else { continue };
                 let len = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
                 if len < file_pos { file_pos = 0; }
@@ -7602,6 +7601,26 @@ async fn prewarm_image_cache(state: tauri::State<'_, AppState>) -> Result<(), St
     Ok(())
 }
 
+/// What the running platform can actually do, so the UI hides controls that
+/// would only ever return an error instead of letting the user discover the
+/// limitation by clicking.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlatformCapabilities {
+    linux: bool,
+    ocr: bool,
+    persistent_credentials: bool,
+}
+
+#[tauri::command]
+fn get_platform_capabilities() -> PlatformCapabilities {
+    PlatformCapabilities {
+        linux: cfg!(target_os = "linux"),
+        ocr: cfg!(target_os = "windows"),
+        persistent_credentials: cfg!(target_os = "windows"),
+    }
+}
+
 #[tauri::command]
 fn open_debug_folder(state: State<AppState>, which: String) -> Result<(), String> {
     let path: std::path::PathBuf = match which.as_str() {
@@ -7613,7 +7632,10 @@ fn open_debug_folder(state: State<AppState>, which: String) -> Result<(), String
         _ => return Err("Unknown debug folder".into()),
     };
     std::fs::create_dir_all(&path).ok();
-    std::process::Command::new("explorer")
+    // `xdg-open` is the desktop-agnostic equivalent of Windows' `explorer`; it
+    // hands the folder to whichever file manager the session has configured.
+    let file_manager = if cfg!(target_os = "windows") { "explorer" } else { "xdg-open" };
+    std::process::Command::new(file_manager)
         .arg(path.to_string_lossy().as_ref())
         .spawn()
         .map_err(|e| e.to_string())?;
@@ -7813,13 +7835,30 @@ fn get_blueprint_names(state: State<AppState>) -> HashMap<String, String> {
 
 #[tauri::command]
 fn get_system_locale() -> String {
-    let mut buf = [0u16; 85]; // LOCALE_NAME_MAX_LENGTH
-    let len = unsafe { windows_sys::Win32::Globalization::GetUserDefaultLocaleName(buf.as_mut_ptr(), buf.len() as i32) };
-    if len > 1 {
-        String::from_utf16_lossy(&buf[..(len as usize - 1)])
-    } else {
-        "en-US".to_string()
+    #[cfg(target_os = "windows")]
+    {
+        let mut buf = [0u16; 85]; // LOCALE_NAME_MAX_LENGTH
+        let len = unsafe { windows_sys::Win32::Globalization::GetUserDefaultLocaleName(buf.as_mut_ptr(), buf.len() as i32) };
+        if len > 1 {
+            return String::from_utf16_lossy(&buf[..(len as usize - 1)]);
+        }
     }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // POSIX locales look like "de_DE.UTF-8" or "de_DE@euro"; the frontend
+        // feeds this to Intl, which wants a BCP-47 tag like "de-DE". LC_TIME
+        // outranks LANG because the locale only ever picks the clock format.
+        let posix = ["LC_ALL", "LC_TIME", "LANG"].iter()
+            .filter_map(|v| std::env::var(v).ok())
+            .find(|s| !s.is_empty());
+        if let Some(lang) = posix {
+            let tag = lang.split(['.', '@']).next().unwrap_or("").replace('_', "-");
+            if !tag.is_empty() && tag != "C" && tag != "POSIX" {
+                return tag;
+            }
+        }
+    }
+    "en-US".to_string()
 }
 
 // ─── App entry point ──────────────────────────────────────────────────────────
@@ -8599,6 +8638,7 @@ pub fn run() {
             wfm_refresh_token,
             wfm_set_jwt,
             wfm_get_jwt,
+            get_platform_capabilities,
             wfm_save_credentials,
             wfm_load_credentials,
             wfm_delete_credentials,

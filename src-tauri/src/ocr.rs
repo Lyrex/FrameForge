@@ -1876,6 +1876,49 @@ pub fn capture_desktop_for_diag() -> Option<(Vec<u8>, u32, u32)> {
 #[cfg(not(target_os = "windows"))]
 pub fn capture_desktop_for_diag() -> Option<(Vec<u8>, u32, u32)> { None }
 
+// ==============================================================================
+// Non-Windows capture and OCR stubs
+// ==============================================================================
+//
+// Screen capture and text recognition both go through Windows-only APIs (GDI,
+// DXGI, WinRT OCR). Linux has no equivalent wired up, so every entry point
+// returns the same explicit error instead of silently producing empty text —
+// callers surface it to the user as "unavailable" rather than "found nothing".
+
+#[cfg(not(target_os = "windows"))]
+const OCR_UNSUPPORTED: &str = "OCR is not supported on Linux";
+
+#[cfg(not(target_os = "windows"))]
+pub fn capture_warframe_pixels() -> Result<(Vec<u8>, u32, u32), String> {
+    Err(OCR_UNSUPPORTED.into())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn capture_screen_for_diagnostics() -> Result<(Vec<u8>, u32, u32), String> {
+    Err(OCR_UNSUPPORTED.into())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn capture_screen_for_diagnostics_half() -> Result<(Vec<u8>, u32, u32), String> {
+    Err(OCR_UNSUPPORTED.into())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn ocr_pixels_rect(
+    _pixels: &[u8], _full_w: u32, _full_h: u32,
+    _x_start: f32, _x_end: f32, _y_start: f32, _y_end: f32,
+) -> Result<String, String> {
+    Err(OCR_UNSUPPORTED.into())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn ocr_pixels_rect_raw(
+    _pixels: &[u8], _full_w: u32, _full_h: u32,
+    _x_start: f32, _x_end: f32, _y_start: f32, _y_end: f32,
+) -> Result<String, String> {
+    Err(OCR_UNSUPPORTED.into())
+}
+
 #[cfg(not(target_os = "windows"))]
 pub fn capture_warframe_reward_area() -> Option<(Vec<u8>, u32, u32, u32, String)> { None }
 

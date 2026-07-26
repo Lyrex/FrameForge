@@ -442,9 +442,52 @@ pub fn scan_warframe_credentials_process() -> Result<(String, String, String), S
     Err("Credentials not found in memory. Make sure you are in the orbiter (not loading screen) and Warframe has been running for a few minutes.".into())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
 pub fn scan_warframe_credentials_process() -> Result<(String, String, String), String> {
-    Err("Only supported on Windows".into())
+    let pid = find_warframe_pid_pub().ok_or("Warframe is not running")?;
+    let process = LinuxProcess::open(pid)?;
+    let regions = linux_process_regions(pid)?;
+
+    scan_linux_credential_regions(&process, regions).ok_or_else(|| {
+        "Credentials not found in memory. Make sure you are in the orbiter (not loading screen) \
+         and Warframe has been running for a few minutes."
+            .into()
+    })
+}
+
+/// Walk readable data mappings looking for the login response the game keeps in
+/// memory. Split from the command above so it can be exercised against the test
+/// process, where the mappings and the expected bytes are both known.
+#[cfg(target_os = "linux")]
+fn scan_linux_credential_regions(
+    process: &LinuxProcess,
+    regions: impl IntoIterator<Item = LinuxRegion>,
+) -> Option<(String, String, String)> {
+    // Matches the Windows scanner's per-region ceiling: anything larger is a
+    // texture or heap arena, not the small JSON blob we are after, and reading
+    // it would cost hundreds of megabytes of copies per scan.
+    const MAX_REGION: usize = 128 * 1024 * 1024;
+
+    for region in regions {
+        if region.executable || region.len > MAX_REGION {
+            continue;
+        }
+        let mut buffer = vec![0; region.len];
+        let read = match process.read(region.start, &mut buffer) {
+            Ok(read) if read > 0 => read,
+            Ok(_) | Err(_) => continue,
+        };
+        let data = &buffer[..read];
+        if let Some((id, nonce)) = scan_auth_credentials(data) {
+            return Some((id, nonce, scan_steam_id(data).unwrap_or_default()));
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub fn scan_warframe_credentials_process() -> Result<(String, String, String), String> {
+    Err("Only supported on Windows and Linux".into())
 }
 
 #[cfg(target_os = "linux")]
@@ -1473,18 +1516,21 @@ fn scan_linux_inventory_regions(
         while index < scans.len() {
             let search_from = scans[index].search_from;
             scans[index].search_from = scans[index].data.len().saturating_sub(END_MARKER.len() - 1);
-            scans[index].data.extend_from_slice(chunk);
-
-            if scans[index].data.len() > MAX_SCAN {
-                scans.swap_remove(index);
-                continue;
-            }
+            let remaining = MAX_SCAN.saturating_sub(scans[index].data.len());
+            let exceeds_limit = chunk.len() > remaining;
+            scans[index]
+                .data
+                .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
 
             let complete = scans[index].data[search_from..]
                 .windows(END_MARKER.len())
                 .any(|window| window == END_MARKER)
                 && find_blob_end(&scans[index].data).is_some();
             if !complete {
+                if exceeds_limit {
+                    scans.swap_remove(index);
+                    continue;
+                }
                 index += 1;
                 continue;
             }
@@ -1945,14 +1991,6 @@ mod linux_tests {
     use super::*;
 
     #[test]
-    fn credential_process_scan_is_unsupported() {
-        assert_eq!(
-            scan_warframe_credentials_process(),
-            Err("Only supported on Windows".to_string())
-        );
-    }
-
-    #[test]
     fn linux_reader_reads_its_own_mapping() {
         let marker = b"frameforge-linux-reader";
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
@@ -1965,6 +2003,37 @@ mod linux_tests {
     }
 
     #[test]
+    fn linux_credential_scan_skips_executable_and_reads_data_regions() {
+        let login = br#"{"id":"594144e63ade7f2f2091c48e","Nonce":123456789,"steamId=76561198000000000"}"#;
+        let code = login.to_vec();
+        let data = login.to_vec();
+        let regions = vec![
+            LinuxRegion {
+                start: code.as_ptr() as usize,
+                len: code.len(),
+                executable: true,
+            },
+            LinuxRegion {
+                start: data.as_ptr() as usize,
+                len: data.len(),
+                executable: false,
+            },
+        ];
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+
+        let found = scan_linux_credential_regions(&process, regions);
+
+        assert_eq!(
+            found,
+            Some((
+                "594144e63ade7f2f2091c48e".to_string(),
+                "123456789".to_string(),
+                "76561198000000000".to_string(),
+            ))
+        );
+    }
+
+    #[test]
     fn linux_inventory_scan_stitches_and_parses_regions() {
         let first_json = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#;
         let second_json = br#""DeathSquadable":false}"#;
@@ -1972,6 +2041,37 @@ mod linux_tests {
         first.resize(64_000, b' ');
         let mut second = second_json.to_vec();
         second.resize(64_000, 0);
+        let regions = vec![
+            LinuxRegion {
+                start: first.as_ptr() as usize,
+                len: first.len(),
+                executable: false,
+            },
+            LinuxRegion {
+                start: second.as_ptr() as usize,
+                len: second.len(),
+                executable: false,
+            },
+        ];
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+        let mut inventory = None;
+
+        scan_linux_inventory_regions(&process, regions, |_, _, parsed| {
+            inventory = Some(parsed);
+            false
+        });
+
+        assert_eq!(inventory.expect("inventory blob is found").credits, 42);
+    }
+
+    #[test]
+    fn linux_inventory_scan_finishes_before_rejecting_large_mapping() {
+        let first_json = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#;
+        let second_json = br#""DeathSquadable":false}"#;
+        let mut first = first_json.to_vec();
+        first.resize(64_000, b' ');
+        let mut second = vec![0; 64 * 1024 * 1024];
+        second[..second_json.len()].copy_from_slice(second_json);
         let regions = vec![
             LinuxRegion {
                 start: first.as_ptr() as usize,
