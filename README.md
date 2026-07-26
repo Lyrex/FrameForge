@@ -2,7 +2,9 @@
 
 A desktop companion for Warframe — live inventory, market prices, trading, timers, relic overlay, and riven analysis. Read-only, no game modification.
 
-> **Windows 10/11 only.** Inventory scanning requires Warframe to be running; all other features work standalone.
+> **Windows 10/11 for the full feature set.** Inventory scanning requires Warframe to be running; all other features work standalone.
+>
+> **Linux** runs from source against Warframe under Steam Proton: inventory and credential scanning work on a best-effort basis through `/proc`, but the relic overlay (screen capture + OCR) and the saved warframe.market session are Windows-only.
 
 ---
 
@@ -96,7 +98,7 @@ Source code is fully public under GPLv3 — build and verify it yourself.
 
 ## Requirements
 
-- Windows 10 or 11 (64-bit)
+- Windows 10 or 11 (64-bit), or Linux running Warframe through Steam Proton (from source only — see below)
 - Warframe installed for inventory scanning (other features work without it)
 - [warframe.market](https://warframe.market) account for trading features (optional)
 
@@ -122,6 +124,26 @@ pnpm install
 pnpm tauri dev      # dev mode with hot reload
 pnpm tauri build    # installer → src-tauri/target/release/bundle/
 ```
+
+### Linux
+
+Linux is a source-only, development-grade target: there is no packaging step,
+and the frontend and backend are started separately.
+
+```sh
+pnpm install
+pnpm dev
+
+# In another terminal:
+cd src-tauri
+cargo run
+```
+
+Warframe must be running through Steam Proton — `EE.log` is read from the
+Proton prefix, and memory scanning reads `/proc/<pid>/mem`, which requires
+`kernel.yama.ptrace_scope` to permit same-user process access. OCR, the relic
+overlay, and persistent warframe.market sessions are unavailable; the affected
+controls are disabled in the UI.
 
 ---
 

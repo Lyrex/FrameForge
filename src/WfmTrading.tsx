@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import ItemMarketPopup from "./ItemMarketPopup";
+import { usePlatformCapabilities } from "./platform";
 import "./WfmTrading.css";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -110,6 +111,10 @@ async function invokeWfm<T>(command: string, args?: Record<string, unknown>): Pr
 // ── Login panel ───────────────────────────────────────────────────────────────
 
 function LoginPanel({ onLogin }: { onLogin: (u: string) => void }) {
+  // Remembering the session needs the OS credential store, which only the
+  // Windows backend has. Where it is missing the option is hidden rather than
+  // offered and quietly ignored.
+  const { persistentCredentials } = usePlatformCapabilities();
   const [email, setEmail]       = useState("");
   const [password, setPassword] = useState("");
   const [remember, setRemember] = useState(true);
@@ -121,7 +126,7 @@ function LoginPanel({ onLogin }: { onLogin: (u: string) => void }) {
     setLoading(true); setError("");
     try {
       const username = await invoke<string>("wfm_login", { email, password });
-      if (remember) {
+      if (remember && persistentCredentials) {
         const tokenJson = await invoke<string | null>("wfm_get_jwt").catch(() => null);
         if (tokenJson) invoke("wfm_save_credentials", { email, password: tokenJson }).catch(() => {});
       }
@@ -146,10 +151,12 @@ function LoginPanel({ onLogin }: { onLogin: (u: string) => void }) {
             onKeyDown={e => e.key === "Enter" && submit()} />
         </div>
         {error && <div className="wfm-error">{error}</div>}
-        <label className="wfm-remember-row">
-          <input type="checkbox" checked={remember} onChange={e => setRemember(e.target.checked)} />
-          Remember credentials
-        </label>
+        {persistentCredentials && (
+          <label className="wfm-remember-row">
+            <input type="checkbox" checked={remember} onChange={e => setRemember(e.target.checked)} />
+            Remember credentials
+          </label>
+        )}
         <button className="wfm-btn-primary" onClick={submit} disabled={loading || !email || !password}>
           {loading ? "Logging in…" : "Log in"}
         </button>
