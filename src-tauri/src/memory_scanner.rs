@@ -1,4 +1,6 @@
-﻿use serde::{Deserialize, Serialize};
+﻿#[cfg(target_os = "linux")]
+use aho_corasick::AhoCorasick;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::fs::File;
@@ -1486,6 +1488,21 @@ fn scan_linux_inventory_regions(
     ];
     const PREFIX_BYTES: usize = 8 * 1024 * 1024;
 
+    // Warframe's address space is several gigabytes, and the naive
+    // `windows().any()` form of these searches walks every byte position once
+    // per marker — eight separate passes per region, which dominated the scan
+    // at roughly 60 MiB/s. One Aho-Corasick automaton answers all three
+    // questions in a single SIMD-accelerated pass instead.
+    let markers = AhoCorasick::new(
+        std::iter::once(START_MARKER)
+            .chain(std::iter::once(MISSION_DELTA))
+            .chain(PREFIX_MARKERS.iter().copied()),
+    )
+    .expect("marker set is a valid literal alternation");
+    const START_PATTERN: usize = 0;
+    const MISSION_PATTERN: usize = 1;
+    let end_marker = AhoCorasick::new([END_MARKER]).expect("end marker is a valid literal");
+
     struct ActiveScan {
         data: Vec<u8>,
         start_address: usize,
@@ -1522,9 +1539,7 @@ fn scan_linux_inventory_regions(
                 .data
                 .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
 
-            let complete = scans[index].data[search_from..]
-                .windows(END_MARKER.len())
-                .any(|window| window == END_MARKER)
+            let complete = end_marker.is_match(&scans[index].data[search_from..])
                 && find_blob_end(&scans[index].data).is_some();
             if !complete {
                 if exceeds_limit {
@@ -1543,15 +1558,16 @@ fn scan_linux_inventory_regions(
             }
         }
 
-        let is_mission = chunk
-            .windows(MISSION_DELTA.len())
-            .any(|window| window == MISSION_DELTA);
-        let start_offset = chunk
-            .windows(START_MARKER.len())
-            .position(|window| window == START_MARKER);
-        let has_prefix = PREFIX_MARKERS
-            .iter()
-            .any(|marker| chunk.windows(marker.len()).any(|window| window == *marker));
+        let mut is_mission = false;
+        let mut start_offset = None;
+        let mut has_prefix = false;
+        for found in markers.find_iter(chunk) {
+            match found.pattern().as_usize() {
+                MISSION_PATTERN => is_mission = true,
+                START_PATTERN => start_offset = start_offset.or(Some(found.start())),
+                _ => has_prefix = true,
+            }
+        }
         if start_offset.is_none() && !is_mission && has_prefix {
             while prefix.iter().map(|item| item.data.len()).sum::<usize>() + read > PREFIX_BYTES
                 && !prefix.is_empty()
@@ -1593,14 +1609,7 @@ fn scan_linux_inventory_regions(
         }
         combined.extend_from_slice(chunk);
 
-        let start_offset = combined
-            .windows(START_MARKER.len())
-            .position(|window| window == START_MARKER)
-            .expect("combined data retains the start marker");
-        let json_open = combined[..start_offset + 1]
-            .windows(2)
-            .position(|window| window == b"{\"")
-            .unwrap_or(start_offset);
+        let (_, json_open) = blob_seed_offsets(&combined);
         let start_address = combined_start + json_open;
         let seed = combined[json_open..].to_vec();
 
@@ -2056,6 +2065,44 @@ mod linux_tests {
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
         let mut inventory = None;
 
+        scan_linux_inventory_regions(&process, regions, |_, _, parsed| {
+            inventory = Some(parsed);
+            false
+        });
+
+        assert_eq!(inventory.expect("inventory blob is found").credits, 42);
+    }
+
+    /// The blob is rarely the first thing in the stitched buffer. When a mapping
+    /// immediately ahead of it carries a Lotus path it joins the prefix chain,
+    /// and seeding at the earliest `{"` in the chain — rather than at the brace
+    /// enclosing the blob — produced a document that died on its first value
+    /// ("expected value at line 1 column 9") and lost the inventory entirely.
+    #[test]
+    fn linux_inventory_scan_seeds_at_the_blob_not_at_earlier_json() {
+        // Qualifies for the prefix buffer: Lotus path, no start marker, no
+        // mission delta — and opens a JSON object of its own.
+        let mut prefix = br#"{"Mods":garbage/Lotus/Weapons/Tenno/Rifle "#.to_vec();
+        prefix.resize(64_000, b' ');
+        let mut blob =
+            br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[{"ItemType":"/Lotus/Types/Items/x"}],"#
+                .to_vec();
+        blob.resize(64_000, b' ');
+        blob.extend_from_slice(br#""DeathSquadable":false}"#);
+        blob.resize(128_000, 0);
+
+        // One arena so the two mappings are genuinely contiguous — adjacency is
+        // what makes the walk chain them.
+        let mut arena = prefix.clone();
+        arena.extend_from_slice(&blob);
+        let base = arena.as_ptr() as usize;
+        let regions = vec![
+            LinuxRegion { start: base, len: prefix.len(), executable: false },
+            LinuxRegion { start: base + prefix.len(), len: blob.len(), executable: false },
+        ];
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+
+        let mut inventory = None;
         scan_linux_inventory_regions(&process, regions, |_, _, parsed| {
             inventory = Some(parsed);
             false
