@@ -2091,6 +2091,27 @@ fn parse_stat_groups(s: &str) -> Vec<Vec<String>> {
     all
 }
 
+/// Weapon-name candidates from the "FITS IN" panel's OCR, top to bottom.
+///
+/// The panel is mostly icon and border debris — single glyphs, punctuation —
+/// with the weapon name and the panel's own buttons as the only real words, so a
+/// candidate is a line of at least four letters that is not one of those
+/// buttons. The name sits below the "FITS IN" label and above "SHOW RANKED",
+/// which is why callers take the last candidate rather than the first.
+fn panel_weapon_candidates(panel: &str) -> Vec<String> {
+    panel
+        .lines()
+        .map(|l| l.trim().to_lowercase())
+        .filter(|l| {
+            l.chars().filter(|c| c.is_alphabetic()).count() >= 4
+                && !says_fits_in(l)
+                && !l.contains("show ranked")
+                && !l.contains("close")
+                && !l.contains("cancel")
+        })
+        .collect()
+}
+
 /// Whether `text` (already lowercased) carries the riven screen's "FITS IN"
 /// panel label. The label is small enough on a 4K frame that Tesseract closes
 /// the word gap and reports "FITSIN", so both sides are compared with spaces
@@ -2625,8 +2646,17 @@ async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
     // hexapha" above the card, which resolves to the ordinary Nukor and its
     // different disposition. Take any panel line the database recognises — the
     // surrounding panel chrome ("SHOW RANKED", icon debris) matches nothing.
-    let weapon = panel_for_weapon.lines()
-        .find_map(|l| find_in_db(&l.trim().to_lowercase()))
+    //
+    // The grading sheet is a curated list, not a weapon index — it carries
+    // "kuva bramma" but not "kuva nukor" — so a panel name it does not know is
+    // still the right answer. Reporting it unmatched costs the roll analysis
+    // (`analyze_riven` returns nothing for an unknown weapon, which the UI
+    // already handles) and buys not silently grading a Kuva Nukor as the base
+    // Nukor it is titled after, on a different disposition.
+    let panel_candidates = panel_weapon_candidates(&panel_for_weapon);
+    let weapon = panel_candidates.iter()
+        .find_map(|l| find_in_db(l))
+        .or_else(|| panel_candidates.last().cloned())
         .or_else(|| lines.iter().enumerate()
             .find(|(_, l)| says_fits_in(&l.to_lowercase()))
             .and_then(|(i, _)| lines.get(i + 1))
@@ -8910,6 +8940,26 @@ X N,
             join_wrapped_stat_lines("+50% Critical Chance\nMR-1\n"),
             vec!["+50% Critical Chance"]
         );
+    }
+
+    /// Verbatim panel OCR from the three example screens. The weapon name has to
+    /// survive whether or not the grading sheet lists it — "kuva nukor" is not in
+    /// the sheet, and reporting the base Nukor in its place would grade the roll
+    /// against a different weapon's disposition.
+    #[test]
+    fn the_panel_yields_the_weapon_name_over_its_own_chrome() {
+        let nukor = "o\n=\n\\\n[\"\no\nIN\nﬁ ‘A l“')\n—\nKuva Nukor\n";
+        assert_eq!(panel_weapon_candidates(nukor).last().unwrap(), "kuva nukor");
+
+        let bramma = "-\nD\n)\nA\n~\n3\n¥\nFITSIN\ne\nKuva Bramma\nSHOW RANKED\n";
+        assert_eq!(panel_weapon_candidates(bramma).last().unwrap(), "kuva bramma");
+
+        // The single-card screen adds a CLOSE button below SHOW RANKED.
+        let single = "\\\nE_ 3\n-\n-~\nFITSIN\n@\nKuva Bramma\nSHOW RANKED\nCLOSE\n";
+        assert_eq!(panel_weapon_candidates(single).last().unwrap(), "kuva bramma");
+
+        // A panel that read as nothing but debris must not name a weapon.
+        assert!(panel_weapon_candidates("\\“ \\\n>~ ‘\n").is_empty());
     }
 
     /// Tesseract closes the gap in the panel label on every screen tested.
