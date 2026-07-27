@@ -648,10 +648,18 @@ async fn scan_warframe_api_urls() -> Result<Vec<String>, String> {
     }).await.map_err(|e| e.to_string())?
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
 #[tauri::command]
 async fn scan_warframe_api_urls() -> Result<Vec<String>, String> {
-    Err("Only supported on Windows".into())
+    tauri::async_runtime::spawn_blocking(memory_scanner::scan_api_url_strings)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+#[tauri::command]
+async fn scan_warframe_api_urls() -> Result<Vec<String>, String> {
+    Err("Only supported on Windows and Linux".into())
 }
 
 /// Persist mastery data (unique_name → rank 0-30) from the Companion API or any other source.
@@ -3089,17 +3097,11 @@ fn riven_screen_visible() -> bool {
 /// Read the riven validity flag byte. Returns None if Warframe is not running.
 /// Returns Some(true) = screen open, Some(false) = screen closed.
 /// Fails open (Some(true)) on read errors so the overlay is never falsely dismissed.
-#[cfg(target_os = "windows")]
+///
+/// Both platforms locate the flag the same way — the instruction pattern lives
+/// in the game's own image, which Proton maps unchanged — so only the one-byte
+/// read differs, and that lives behind `memory_scanner::read_process_byte`.
 fn read_riven_flag_byte() -> Option<bool> {
-    use windows_sys::Win32::{
-        Foundation::CloseHandle,
-        System::{
-            Diagnostics::Debug::ReadProcessMemory,
-            Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
-        },
-    };
-    use std::ffi::c_void;
-
     let pid = memory_scanner::find_warframe_pid_pub()?;
 
     let cache = RIVEN_FLAG_VA.get_or_init(|| std::sync::Mutex::new(None));
@@ -3117,23 +3119,10 @@ fn read_riven_flag_byte() -> Option<bool> {
     };
     drop(cached);
 
-    let handle = unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, 0, pid) };
-    if handle == 0 { return Some(true); }
-
-    let mut byte: u8 = 0;
-    let mut read = 0usize;
-    let ok = unsafe {
-        ReadProcessMemory(handle, flag_va as *const c_void,
-            &mut byte as *mut u8 as *mut c_void, 1, &mut read)
-    };
-    unsafe { CloseHandle(handle); }
-
-    if ok == 0 || read == 0 { return Some(true); } // read failed — fail open
-    Some(byte != 0)
+    // Read failure means the mapping moved or access was lost, not that the
+    // screen closed — fail open so an active overlay is never dismissed.
+    Some(memory_scanner::read_process_byte(pid, flag_va).map_or(true, |byte| byte != 0))
 }
-
-#[cfg(not(target_os = "windows"))]
-fn read_riven_flag_byte() -> Option<bool> { None }
 
 /// Background thread: polls the riven validity flag every 200 ms and emits
 /// riven-screen-open-mem / riven-screen-close-mem on state transitions.

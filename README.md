@@ -4,7 +4,7 @@ A desktop companion for Warframe — live inventory, market prices, trading, tim
 
 > **Windows 10/11 for the full feature set.** Inventory scanning requires Warframe to be running; all other features work standalone.
 >
-> **Linux** runs from source against Warframe under Steam Proton: inventory and credential scanning work on a best-effort basis through `/proc`, but the relic overlay (screen capture + OCR) and the saved warframe.market session are Windows-only.
+> **Linux** runs against Warframe under Steam Proton: inventory, credential, and diagnostic memory scanning work on a best-effort basis through `/proc`, but the relic overlay (screen capture + OCR) and the saved warframe.market session are Windows-only.
 
 ---
 
@@ -98,7 +98,7 @@ Source code is fully public under GPLv3 — build and verify it yourself.
 
 ## Requirements
 
-- Windows 10 or 11 (64-bit), or Linux running Warframe through Steam Proton (from source only — see below)
+- Windows 10 or 11 (64-bit), or Linux running Warframe through Steam Proton (build it yourself — see below)
 - Warframe installed for inventory scanning (other features work without it)
 - [warframe.market](https://warframe.market) account for trading features (optional)
 
@@ -127,8 +127,8 @@ pnpm tauri build    # installer → src-tauri/target/release/bundle/
 
 ### Linux
 
-Linux is a source-only, development-grade target: there is no packaging step,
-and the frontend and backend are started separately.
+No Linux release is published, so build it yourself. For development the
+frontend and backend are started separately:
 
 ```sh
 pnpm install
@@ -138,6 +138,17 @@ pnpm dev
 cd src-tauri
 cargo run
 ```
+
+Packages build with the normal command:
+
+```sh
+NO_STRIP=true pnpm tauri build   # deb, rpm and AppImage in src-tauri/target/release/bundle/
+```
+
+`NO_STRIP=true` is only needed for the AppImage: linuxdeploy ships an old
+`strip` that cannot read the `.relr.dyn` sections modern distributions use, and
+it aborts the bundle rather than skipping the library. Building only `deb` and
+`rpm` (`--bundles deb,rpm`) does not need it.
 
 Warframe must be running through Steam Proton — `EE.log` is read from the
 Proton prefix, and memory scanning reads `/proc/<pid>/mem`, which requires

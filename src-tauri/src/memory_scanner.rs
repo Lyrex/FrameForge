@@ -492,6 +492,108 @@ pub fn scan_warframe_credentials_process() -> Result<(String, String, String), S
     Err("Only supported on Windows and Linux".into())
 }
 
+// ==============================================================================
+// Shared Linux region walk
+// ==============================================================================
+//
+// The diagnostic tools below each want the same thing: every readable mapping,
+// in bounded pieces, with the address the bytes came from. On Windows each of
+// them open-codes its own `VirtualQueryEx` loop; on Linux they share this one
+// so the read caps, the deadline, and the procfs error text stay in one place.
+//
+// `visit` returning false stops the walk early — used by the callers that cap
+// their output.
+
+/// Hand every mapping `accept` selects to `visit` in chunks, lowest address
+/// first. Callers differ in what they want — inventory data, code, or both —
+/// so the filter is theirs to supply rather than a flag this has to interpret.
+#[cfg(target_os = "linux")]
+fn walk_linux_regions(
+    pid: u32,
+    accept: impl Fn(&LinuxRegion) -> bool,
+    deadline: std::time::Instant,
+    mut visit: impl FnMut(usize, &[u8]) -> bool,
+) -> Result<(), String> {
+    // Matches the Windows tools: large mappings are read in 64 MiB pieces so a
+    // multi-gigabyte arena cannot blow up the heap.
+    const CHUNK: usize = 64 * 1024 * 1024;
+    const MIN_USEFUL: usize = 8;
+
+    let process = LinuxProcess::open(pid)?;
+    let regions = linux_process_regions(pid)?;
+
+    let mut buffer = Vec::new();
+    for region in regions {
+        if !accept(&region) {
+            continue;
+        }
+        let mut offset = 0;
+        while offset < region.len {
+            if std::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            let size = CHUNK.min(region.len - offset);
+            let address = region.start + offset;
+            offset += size;
+
+            buffer.resize(size, 0);
+            let read = match process.read(address, &mut buffer[..size]) {
+                Ok(read) if read >= MIN_USEFUL => read,
+                Ok(_) | Err(_) => continue,
+            };
+            if !visit(address, &buffer[..read]) {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read a single byte from the game process, used for the riven validity flag.
+/// `None` means the process or the address is not readable.
+#[cfg(target_os = "windows")]
+pub fn read_process_byte(pid: u32, address: usize) -> Option<u8> {
+    use std::ffi::c_void;
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::{
+            Diagnostics::Debug::ReadProcessMemory,
+            Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
+        },
+    };
+
+    unsafe {
+        let process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, 0, pid);
+        if process == 0 {
+            return None;
+        }
+        let mut byte: u8 = 0;
+        let mut read = 0usize;
+        let ok = ReadProcessMemory(
+            process,
+            address as *const c_void,
+            &mut byte as *mut u8 as *mut c_void,
+            1,
+            &mut read,
+        );
+        CloseHandle(process);
+        (ok != 0 && read == 1).then_some(byte)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn read_process_byte(pid: u32, address: usize) -> Option<u8> {
+    let process = LinuxProcess::open(pid).ok()?;
+    let mut byte = [0u8; 1];
+    match process.read(address, &mut byte) {
+        Ok(1) => Some(byte[0]),
+        _ => None,
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub fn read_process_byte(_pid: u32, _address: usize) -> Option<u8> { None }
+
 #[cfg(target_os = "linux")]
 fn is_warframe_command(command: &str) -> bool {
     let command = command.to_ascii_lowercase();
@@ -626,9 +728,123 @@ pub fn dump_inventory_regions(max_hits: usize) -> Vec<String> {
     results
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+pub fn dump_inventory_regions(max_hits: usize) -> Vec<String> {
+    // Same needles and context window as the Windows probe so saved output from
+    // either platform reads the same way.
+    const NEEDLES: &[&[u8]] = &[
+        b"\"MiscItems\":[{",
+        b"\"ItemCount\":",
+        b"MiscItems",
+        b"AlloyPlate",
+        b"Circuits\"",
+        b"/Lotus/Types/Items/MiscItems/",
+    ];
+    const HITS_PER_NEEDLE: usize = 3;
+
+    let Some(pid) = find_warframe_pid_pub() else {
+        return vec!["Warframe is not running".to_string()];
+    };
+
+    let mut results: Vec<String> = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let walk = walk_linux_regions(pid, |region| !region.executable, deadline, |address, data| {
+        for needle in NEEDLES {
+            let mut search = 0;
+            for _ in 0..HITS_PER_NEEDLE {
+                if results.len() >= max_hits {
+                    return false;
+                }
+                let Some(relative) = data[search..]
+                    .windows(needle.len())
+                    .position(|window| window == *needle)
+                else {
+                    break;
+                };
+                let position = search + relative;
+                let context_start = position.saturating_sub(80);
+                let context_end = data.len().min(position + 200);
+                let snippet: String = data[context_start..context_end]
+                    .iter()
+                    .map(|&byte| if (0x20..0x7f).contains(&byte) { byte as char } else { '·' })
+                    .collect();
+                results.push(format!(
+                    "0x{:012x}  needle=\"{}\"  ctx: {}",
+                    address + context_start,
+                    String::from_utf8_lossy(needle),
+                    snippet
+                ));
+                search = position + needle.len();
+            }
+        }
+        true
+    });
+
+    if let Err(error) = walk {
+        return vec![error];
+    }
+    if results.is_empty() {
+        results.push("No matches found".to_string());
+    }
+    results
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub fn dump_inventory_regions(_max_hits: usize) -> Vec<String> {
-    vec!["Only supported on Windows".to_string()]
+    vec!["Only supported on Windows and Linux".to_string()]
+}
+
+/// Collect context around the request strings the game builds its API calls
+/// from. The Windows equivalent is inlined in the command in `lib.rs`; on Linux
+/// it lives here so it can share the region walk with the other probes.
+#[cfg(target_os = "linux")]
+pub fn scan_api_url_strings() -> Result<Vec<String>, String> {
+    const NEEDLES: &[&[u8]] = &[
+        b"/API/PHP/",
+        b"inventory.php",
+        b"login.php",
+        b"warframe.com/A",
+        b"Nonce",
+        b"accountId",
+    ];
+    const MAX_RESULTS: usize = 40;
+
+    let pid = find_warframe_pid_pub().ok_or("Warframe not running")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut found: Vec<String> = Vec::new();
+
+    walk_linux_regions(pid, |region| !region.executable, deadline, |_, data| {
+        for needle in NEEDLES {
+            let mut search = 0;
+            while let Some(relative) = data[search..]
+                .windows(needle.len())
+                .position(|window| window == *needle)
+            {
+                let position = search + relative;
+                search = position + needle.len();
+
+                let start = position.saturating_sub(30);
+                let end = (position + 100).min(data.len());
+                let context: String = data[start..end]
+                    .iter()
+                    .map(|&byte| if (0x20..0x7f).contains(&byte) { byte as char } else { ' ' })
+                    .collect();
+                let trimmed = context.split_whitespace().collect::<Vec<_>>().join(" ");
+                // Near-identical strings appear in thousands of copies, so the
+                // first 30 characters act as the deduplication key.
+                let key = &trimmed[..trimmed.len().min(30)];
+                if !found.iter().any(|seen| seen.contains(key)) {
+                    found.push(format!("[{}] {}", String::from_utf8_lossy(needle), trimmed));
+                }
+                if found.len() >= MAX_RESULTS {
+                    return false;
+                }
+            }
+        }
+        true
+    })?;
+
+    Ok(found)
 }
 
 // ─── One-shot inventory blob capture ─────────────────────────────────────────
@@ -1878,9 +2094,49 @@ pub fn raw_scan_pass(out: &mut impl std::io::Write) -> Result<usize, String> {
     Ok(count)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+pub fn raw_scan_pass(out: &mut impl std::io::Write) -> Result<usize, String> {
+    const MIN_LEN: usize = 8;
+    const TIMEOUT: u64 = 600; // 10 minutes — full coverage over a full scan
+
+    let pid = find_warframe_pid_pub().ok_or("Warframe not running")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT);
+    let mut count = 0usize;
+
+    // Executable mappings are included: the game's constant string tables live
+    // in read-execute sections, and they are half the point of a raw dump.
+    walk_linux_regions(pid, |_| true, deadline, |address, data| {
+        let mut run_start = None;
+        for (index, &byte) in data.iter().enumerate() {
+            if (0x20..0x7f).contains(&byte) {
+                run_start.get_or_insert(index);
+                continue;
+            }
+            if let Some(start) = run_start.take() {
+                if index - start >= MIN_LEN {
+                    let text = std::str::from_utf8(&data[start..index]).unwrap_or("?");
+                    let _ = writeln!(out, "0x{:012x}  {}", address + start, text);
+                    count += 1;
+                }
+            }
+        }
+        // A run that reaches the end of the chunk is still worth reporting.
+        if let Some(start) = run_start {
+            if data.len() - start >= MIN_LEN {
+                let text = std::str::from_utf8(&data[start..]).unwrap_or("?");
+                let _ = writeln!(out, "0x{:012x}  {}", address + start, text);
+                count += 1;
+            }
+        }
+        true
+    })?;
+
+    Ok(count)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub fn raw_scan_pass(_out: &mut impl std::io::Write) -> Result<usize, String> {
-    Err("Only supported on Windows".into())
+    Err("Only supported on Windows and Linux".into())
 }
 
 // ─── Riven validity flag scanner ──────────────────────────────────────────────
@@ -1897,7 +2153,7 @@ pub fn raw_scan_pass(_out: &mut impl std::io::Write) -> Result<usize, String> {
 //   The CMP instruction is 7 bytes. RIP at execution = match_va + 7.
 //   flag_va = (match_va + 7) + i32::from_le_bytes(bytes[2..6])
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn find_pattern_d2(data: &[u8], base_va: usize) -> Option<usize> {
     let len = data.len();
     if len < 13 { return None; }
@@ -1973,7 +2229,69 @@ pub fn find_riven_validity_va(pid: u32) -> Option<usize> {
     result
 }
 
-#[cfg(not(target_os = "windows"))]
+/// Linux counterpart: Proton maps the same PE image, so the same instruction
+/// pattern sits in the game's executable mappings. Those are exactly the
+/// mappings the inventory scan skips, so this is the one caller that asks the
+/// walk for executable memory.
+/// Address span of the game's own module, from the mappings procfs attributes
+/// to `Warframe.x64.exe`.
+///
+/// Wine does not leave the executable's code file-backed — only the PE headers
+/// and one data section keep the pathname, while `.text` becomes a large
+/// anonymous executable mapping wedged between them. So the module is
+/// identified by the span its named mappings bracket, not by file backing.
+#[cfg(target_os = "linux")]
+fn linux_game_image_span(pid: u32) -> Option<std::ops::Range<usize>> {
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
+    let mut span: Option<std::ops::Range<usize>> = None;
+    for line in maps.lines() {
+        if !line.to_ascii_lowercase().ends_with("warframe.x64.exe") {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let (start, end) = fields.next()?.split_once('-')?;
+        let (start, end) = (
+            usize::from_str_radix(start, 16).ok()?,
+            usize::from_str_radix(end, 16).ok()?,
+        );
+        span = Some(match span {
+            Some(current) => current.start.min(start)..current.end.max(end),
+            None => start..end,
+        });
+    }
+    span
+}
+
+// ponytail: the Proton match is unverified — the byte reads non-zero with no
+// riven screen open, so confirm against an actual reroll screen before wiring
+// `start_riven_memory_watcher` up to anything on Linux.
+#[cfg(target_os = "linux")]
+pub fn find_riven_validity_va(pid: u32) -> Option<usize> {
+    const MIN_PATTERN: usize = 13;
+    const MAX_IMAGE: usize = 64 * 1024 * 1024;
+
+    let span = linux_game_image_span(pid)?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut result = None;
+    let walk = walk_linux_regions(
+        pid,
+        |region| {
+            region.executable
+                && span.contains(&region.start)
+                && (MIN_PATTERN..=MAX_IMAGE).contains(&region.len)
+        },
+        deadline,
+        |address, data| {
+            result = find_pattern_d2(data, address);
+            result.is_none()
+        },
+    );
+    walk.ok()?;
+    result
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub fn find_riven_validity_va(_pid: u32) -> Option<usize> { None }
 
 #[cfg(target_os = "linux")]
