@@ -59,3 +59,7 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tesseract = "0.15.2"
+xcb = "1.7"

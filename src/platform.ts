@@ -5,8 +5,9 @@ import { invoke } from "@tauri-apps/api/core";
 // Platform capabilities
 // ==============================================================================
 //
-// Screen capture, OCR, and OS-encrypted credential storage only exist in the
-// Windows backend. The UI asks the backend what it can do instead of hiding
+// Not every backend implements every feature: OS-encrypted credential storage
+// is Windows-only, and screen capture and OCR exist on Windows and Linux but
+// nowhere else. The UI asks the backend what it can do instead of hiding
 // features behind a user-agent guess, so a control is only offered when the
 // command behind it can actually succeed.
 //

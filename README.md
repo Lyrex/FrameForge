@@ -4,7 +4,7 @@ A desktop companion for Warframe — live inventory, market prices, trading, tim
 
 > **Windows 10/11 for the full feature set.** Inventory scanning requires Warframe to be running; all other features work standalone.
 >
-> **Linux** runs against Warframe under Steam Proton: inventory, credential, and diagnostic memory scanning work on a best-effort basis through `/proc`, but the relic overlay (screen capture + OCR) and the saved warframe.market session are Windows-only.
+> **Linux** runs against Warframe under Steam Proton: memory scanning goes through `/proc`, and screen capture and OCR through X11 and Tesseract. Only the saved warframe.market session is Windows-only, since there is no OS credential store behind it.
 
 ---
 
@@ -152,9 +152,9 @@ it aborts the bundle rather than skipping the library. Building only `deb` and
 
 Warframe must be running through Steam Proton — `EE.log` is read from the
 Proton prefix, and memory scanning reads `/proc/<pid>/mem`, which requires
-`kernel.yama.ptrace_scope` to permit same-user process access. OCR, the relic
-overlay, and persistent warframe.market sessions are unavailable; the affected
-controls are disabled in the UI.
+`kernel.yama.ptrace_scope` to permit same-user process access. Persistent
+warframe.market sessions are unavailable, and the "remember me" control is
+hidden rather than offered.
 
 ---
 

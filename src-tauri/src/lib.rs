@@ -2473,21 +2473,27 @@ async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
             let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
             let px = ocr::capture_warframe_pixels().map_err(|e| format!("Capture: {}", e))?;
             let (pixels, w, h) = px;
-            let full_text = ocr::ocr_pixels_rect(&pixels, w, h, 0.0, 1.0, 0.0, 0.82)
+            let full_text = ocr::ocr_pixels_rect(&pixels, w, h, 0.0, 1.0, 0.0, 0.82, ocr::OcrLayout::Scattered)
                 .unwrap_or_default();
-            let card_text = ocr::ocr_pixels_rect(&pixels, w, h, 0.20, 0.65, 0.28, 0.82)
+            let card_text = ocr::ocr_pixels_rect(&pixels, w, h, 0.20, 0.65, 0.28, 0.82, ocr::OcrLayout::Block)
+                .unwrap_or_default();
+            // "FITS IN" is a two-word label in the far right panel. Over a whole
+            // 4K frame it is small enough to be missed, so it gets the same
+            // dedicated crop that riven_screen_visible reads it from.
+            let panel_text = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.73, 1.0, 0.30, 0.80, ocr::OcrLayout::Block)
                 .unwrap_or_default();
             let _ = append_to_file(&riven_log2, &format!(
-                "[STEP 2] OCR attempt {} — {}\n├─ Full text:\n{}\n└─ Card text:\n{}\n\n",
-                attempt + 1, ts, full_text, card_text
+                "[STEP 2] OCR attempt {} — {}\n├─ Full text:\n{}\n├─ Panel text:\n{}\n└─ Card text:\n{}\n\n",
+                attempt + 1, ts, full_text, panel_text, card_text
             ));
-            Ok::<_, String>((full_text, card_text))
+            Ok::<_, String>((full_text, panel_text, card_text))
         }).await.map_err(|e| format!("Task: {}", e))??;
 
-        let (full_text, card_text) = attempt_result;
+        let (full_text, panel_text, card_text) = attempt_result;
         let lower = full_text.to_lowercase();
         let has_header  = lower.contains("inventory") || lower.contains("mods");
-        let has_fits_in = lower.contains("fits in");
+        let has_fits_in = lower.contains("fits in")
+            || panel_text.to_lowercase().contains("fits in");
 
         let _ = append_to_file(&riven_log, &format!(
             "[STEP 2] attempt {} — header={} fits_in={}\n",
@@ -2543,8 +2549,8 @@ async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
             match ocr::capture_warframe_pixels() {
                 Ok((px, w, h)) => {
                     // Wider y range to catch element-icon stat lines near card bottom
-                    let left  = ocr::ocr_pixels_rect(&px, w, h, 0.18, 0.44, 0.25, 0.84).unwrap_or_default();
-                    let right = ocr::ocr_pixels_rect(&px, w, h, 0.44, 0.68, 0.25, 0.84).unwrap_or_default();
+                    let left  = ocr::ocr_pixels_rect(&px, w, h, 0.18, 0.44, 0.25, 0.84, ocr::OcrLayout::Block).unwrap_or_default();
+                    let right = ocr::ocr_pixels_rect(&px, w, h, 0.44, 0.68, 0.25, 0.84, ocr::OcrLayout::Block).unwrap_or_default();
                     let _ = append_to_file(&riven_log3, &format!(
                         "[STEP 2] Original (left):\n{}\n\nNew roll (right):\n{}\n\n", left, right
                     ));
@@ -3022,7 +3028,7 @@ fn riven_screen_status() -> String {
         return "unknown".into();
     };
 
-    let header = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.0, 0.55, 0.0, 0.10)
+    let header = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.0, 0.55, 0.0, 0.10, ocr::OcrLayout::Block)
         .unwrap_or_default();
     let in_inventory = header.to_lowercase().contains("inventory");
 
@@ -3031,7 +3037,7 @@ fn riven_screen_status() -> String {
         return "unknown".into();
     }
 
-    let right = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.73, 1.0, 0.30, 0.80)
+    let right = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.73, 1.0, 0.30, 0.80, ocr::OcrLayout::Block)
         .unwrap_or_default();
     let rl = right.to_lowercase();
     // In comparison mode "FITS IN" may be partially cut off, reading as "SIN", "IN", "TS IN" etc.
@@ -3065,7 +3071,7 @@ fn riven_screen_visible() -> bool {
 
     // Check header (x 0–55%, y 0–10%) for "INVENTORY" — confirms Warframe is focused
     // and we're in the mods screen. If header is absent, user alt-tabbed; keep overlay.
-    let header = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.0, 0.55, 0.0, 0.10)
+    let header = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.0, 0.55, 0.0, 0.10, ocr::OcrLayout::Block)
         .unwrap_or_default();
     let in_inventory = header.to_lowercase().contains("inventory");
 
@@ -3077,7 +3083,7 @@ fn riven_screen_visible() -> bool {
     }
 
     // Check right panel (x 73–100%, y 30–80%) for "FITS IN"
-    let right = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.73, 1.0, 0.30, 0.80)
+    let right = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.73, 1.0, 0.30, 0.80, ocr::OcrLayout::Block)
         .unwrap_or_default();
     let fits_in_visible = right.to_lowercase().contains("fits");
     let right_preview = right.lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join(" | ");
@@ -3098,12 +3104,11 @@ fn riven_screen_visible() -> bool {
 /// Returns Some(true) = screen open, Some(false) = screen closed.
 /// Fails open (Some(true)) on read errors so the overlay is never falsely dismissed.
 ///
-/// Both platforms locate the flag the same way — the instruction pattern lives
-/// in the game's own image, which Proton maps unchanged — so only the one-byte
-/// read differs, and that lives behind `memory_scanner::read_process_byte`.
-fn read_riven_flag_byte() -> Option<bool> {
-    let pid = memory_scanner::find_warframe_pid_pub()?;
-
+/// Takes the PID from the caller: enumerating processes costs a `/proc` walk on
+/// Linux and a snapshot on Windows, and the only caller polls five times a
+/// second, so looking it up again here would double that for no new
+/// information.
+fn read_riven_flag_byte(pid: u32) -> Option<bool> {
     let cache = RIVEN_FLAG_VA.get_or_init(|| std::sync::Mutex::new(None));
     let mut cached = cache.lock().unwrap_or_else(|e| e.into_inner());
     if cached.map_or(true, |(p, _)| p != pid) {
@@ -3142,8 +3147,8 @@ fn start_riven_memory_watcher(app: tauri::AppHandle) {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
 
-            let pid_found = memory_scanner::find_warframe_pid_pub().is_some();
-            if !pid_found {
+            let pid = memory_scanner::find_warframe_pid_pub();
+            let Some(pid) = pid else {
                 // Warframe not running — reset state
                 if warframe_was_running {
                     prev_open = false;
@@ -3151,10 +3156,10 @@ fn start_riven_memory_watcher(app: tauri::AppHandle) {
                     warframe_was_running = false;
                 }
                 continue;
-            }
+            };
             warframe_was_running = true;
 
-            match read_riven_flag_byte() {
+            match read_riven_flag_byte(pid) {
                 None => {
                     // Warframe running but pattern VA not found yet — don't change state,
                     // just wait. This avoids a false open event on app start.
@@ -5401,9 +5406,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                         ));
                     }
 
-                    if let Some(win) = ee_ocr_app.get_webview_window("relic-overlay") {
-                        let _ = win.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x: 0, y: -3000 }));
-                    }
+                    park_overlay_offscreen(&ee_ocr_app, "relic-overlay");
                     if let Ok(mut g) = ee_ocr_app.state::<AppState>().pending_relic_rewards.lock() { *g = None; }
                     let _ = ee_ocr_app.emit("relic-rewards", serde_json::Value::Null);
                 }
@@ -5770,9 +5773,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                                                 tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                                                 if let Ok(mut g) = app2.state::<AppState>().pending_relic_rewards.lock() { *g = None; }
                                                 let _ = app2.emit("relic-rewards", serde_json::Value::Null);
-                                                if let Some(w) = app2.get_webview_window("relic-overlay") {
-                                                    let _ = w.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x: 0, y: -3000 }));
-                                                }
+                                                park_overlay_offscreen(&app2, "relic-overlay");
                                                 append_to_diag(&slog2,
                                                     "[STEP 4] AUTO-DISMISS (20s safety fallback)\n\n");
                                                 if let Ok(mut g) = diag_arc_fb.lock() {
@@ -5828,9 +5829,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                                             tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                                             if let Ok(mut g) = app2.state::<AppState>().pending_relic_rewards.lock() { *g = None; }
                                             let _ = app2.emit("relic-rewards", serde_json::Value::Null);
-                                            if let Some(w) = app2.get_webview_window("relic-overlay") {
-                                                let _ = w.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x: 0, y: -3000 }));
-                                            }
+                                            park_overlay_offscreen(&app2, "relic-overlay");
                                             let _ = append_to_file(&slog2,
                                                 "[STEP 4] AUTO-DISMISS (20s safety fallback)\n\n");
                                             if let Ok(mut g) = diag_arc_fb.lock() {
@@ -5923,9 +5922,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                                 let _ = app.emit("relic-rewards", &emit_val);
                                 let _ = append_to_file(&slog,
                                     "[STEP 2] OCR TIMEOUT — 45 seconds elapsed, emitting best result\n\n");
-                                if let Some(win) = app.get_webview_window("relic-overlay") {
-                                    let _ = win.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x: 0, y: -3000 }));
-                                }
+                                park_overlay_offscreen(&app, "relic-overlay");
                                 active.store(false, Ordering::SeqCst);
                                 if let Ok(mut g) = diag_arc2.lock() {
                                     if let Some(folder) = g.take() {
@@ -5964,9 +5961,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                         reward_screen_active2.store(false, Ordering::SeqCst);
                         active_since = None;
                         last_dismiss_at = Some(std::time::Instant::now());
-                        if let Some(win) = ee_ocr_app.get_webview_window("relic-overlay") {
-                            let _ = win.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x: 0, y: -3000 }));
-                        }
+                        park_overlay_offscreen(&ee_ocr_app, "relic-overlay");
                         if let Ok(mut g) = ee_ocr_app.state::<AppState>().pending_relic_rewards.lock() { *g = None; }
                         let _ = ee_ocr_app.emit("relic-rewards", serde_json::Value::Null);
                     }
@@ -7347,6 +7342,26 @@ fn debug_create_window(app: tauri::AppHandle) -> Result<String, String> {
     .map_err(|e| format!("build() failed: {e}"))
 }
 
+/// Visually hide an overlay window without destroying it.
+///
+/// The two platforms need opposite primitives here. On Windows the window is
+/// parked off-screen because `hide()` on a transparent WebView2 window breaks
+/// DirectComposition — JS keeps running but its pixels stop reaching the screen,
+/// so the overlay comes back blank. On Linux `hide()` is the only thing that
+/// works: KWin keeps windows inside the desktop and clamps y=-3000 back to 0,
+/// which would leave the transparent overlay parked over the primary monitor.
+fn park_overlay_offscreen(app: &tauri::AppHandle, label: &str) {
+    use tauri::Manager;
+    let Some(win) = app.get_webview_window(label) else { return };
+    #[cfg(target_os = "linux")]
+    let _ = win.hide();
+    #[cfg(not(target_os = "linux"))]
+    let _ = win.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
+        x: 0,
+        y: -3000,
+    }));
+}
+
 /// Reposition the pre-declared relic-overlay window and bring it on screen.
 /// The overlay is pre-declared in tauri.conf.json at y=-3000 (off-screen) so
 /// WebView2 initialises at app startup. We never create/destroy it — just move it.
@@ -7390,12 +7405,7 @@ fn show_overlay_window(
 /// Destroying and recreating transparent WebView2 windows deadlocks on Windows.
 #[tauri::command]
 fn move_overlay_offscreen(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri::Manager;
-    if let Some(win) = app.get_webview_window("relic-overlay") {
-        let _ = win.set_position(tauri::Position::Physical(
-            tauri::PhysicalPosition { x: 0, y: -3000 }
-        ));
-    }
+    park_overlay_offscreen(&app, "relic-overlay");
     Ok(())
 }
 
@@ -7439,9 +7449,7 @@ fn hide_test_overlay_window(app: tauri::AppHandle) -> Result<(), String> {
     let win = app.get_webview_window("overlay-test")
         .ok_or_else(|| "overlay-test window not found".to_string())?;
     let _ = win.set_always_on_top(false);
-    let _ = win.set_position(tauri::Position::Physical(
-        tauri::PhysicalPosition { x: 0, y: -3000 }
-    ));
+    park_overlay_offscreen(&app, "overlay-test");
     eprintln!("[OVERLAY-TEST] hide_test_overlay_window: moved offscreen");
     Ok(())
 }
@@ -7605,7 +7613,9 @@ struct PlatformCapabilities {
 fn get_platform_capabilities() -> PlatformCapabilities {
     PlatformCapabilities {
         linux: cfg!(target_os = "linux"),
-        ocr: cfg!(target_os = "windows"),
+        // Linux grabs the game window over X11 and reads it with Tesseract, so
+        // every screen-reading feature is available there too.
+        ocr: cfg!(any(target_os = "windows", target_os = "linux")),
         persistent_credentials: cfg!(target_os = "windows"),
     }
 }
@@ -7781,8 +7791,12 @@ async fn capture_diagnostics(state: State<'_, AppState>) -> Result<String, Strin
 /// both exclude the window title bar and borders in windowed mode.
 #[tauri::command]
 fn get_warframe_window_rect() -> Result<[i32; 4], String> {
-    #[cfg(not(target_os = "windows"))]
-    { return Err("Windows only".into()); }
+    // Linux reads the geometry from the same X11 window the capture grabs, so the
+    // rect and the captured frame can never describe different areas.
+    #[cfg(target_os = "linux")]
+    { return ocr::warframe_window_rect(); }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    { return Err("Windows and Linux only".into()); }
     #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::Foundation::{POINT, RECT};
@@ -8331,6 +8345,27 @@ fn restore_window_state(app: &tauri::AppHandle, window: &tauri::WebviewWindow, s
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // ==========================================================================
+    // Linux: run the GTK/WebKit side under XWayland, not native Wayland
+    // ==========================================================================
+    //
+    // The relic and riven overlays exist to sit exactly on top of the game
+    // window, and they are hidden by being parked off-screen. Wayland gives a
+    // client no say in where its own surfaces go, so under the native backend
+    // `set_position` silently does nothing: the overlay would appear wherever the
+    // compositor decided, and "hiding" it off-screen would leave it on screen.
+    //
+    // Forcing GDK to the X11 backend restores absolute positioning and
+    // always-on-top, and it costs nothing in fidelity here — Warframe itself runs
+    // under XWayland (it is a Proton/Wine X11 client), so the overlay ends up in
+    // the same coordinate space as the window it tracks.
+    //
+    // Set before any GTK call, which for Tauri means before the builder runs.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("GDK_BACKEND").is_none() {
+        std::env::set_var("GDK_BACKEND", "x11");
+    }
+
     let data_dir = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("warframe-companion");
@@ -8508,26 +8543,19 @@ pub fn run() {
             }
 
             // Overlay windows start as visible:false in tauri.conf.json.
-            // We call show() here (while they are still at y=-3000) so WebView2 can
-            // initialise their content in the background without flashing on screen.
-            // We NEVER call hide() on relic-overlay — hiding a transparent WebView2
-            // window breaks DirectComposition: JS keeps running but pixels stop reaching
-            // the screen.  Instead we park it at y=-3000 and move it on-screen during
-            // fissures.  overlay-test is not transparent so hide() is safe for it, but
-            // we use the same show()-once pattern for consistency.
-            // show() triggers WebView2 initialisation; immediately park off-screen so
-            // nothing is visible to the user at startup.
-            // We NEVER call hide() on relic-overlay — hiding a transparent WebView2
-            // window breaks DirectComposition.
+            // Overlay windows start as visible:false in tauri.conf.json. show() here
+            // triggers webview initialisation so the first fissure doesn't pay for it,
+            // and the window is put away again immediately so nothing flashes on
+            // screen. How "away" is achieved differs per platform — see
+            // park_overlay_offscreen.
             // Only relic-overlay needs pre-initialization at startup (to avoid the
             // WebView2 init delay on the first fissure).  overlay-test is on-demand only.
             if let Some(win) = app.get_webview_window("relic-overlay") {
                 let _ = win.show();
                 // Windows may reposition a newly-shown window that is outside all
-                // monitors.  Force it back off-screen immediately after show().
-                let _ = win.set_position(tauri::Position::Physical(
-                    tauri::PhysicalPosition { x: 0, y: -3000 }
-                ));
+                // monitors, and KWin clamps one to y=0 outright — either way the
+                // window has to be put away again right after show().
+                park_overlay_offscreen(app.handle(), "relic-overlay");
             }
 
             // Load relics.run prices in the background. On a cache hit (today's file exists)
