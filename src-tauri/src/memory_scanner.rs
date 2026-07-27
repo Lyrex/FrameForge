@@ -2153,7 +2153,7 @@ pub fn raw_scan_pass(_out: &mut impl std::io::Write) -> Result<usize, String> {
 //   The CMP instruction is 7 bytes. RIP at execution = match_va + 7.
 //   flag_va = (match_va + 7) + i32::from_le_bytes(bytes[2..6])
 
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(target_os = "windows")]
 fn find_pattern_d2(data: &[u8], base_va: usize) -> Option<usize> {
     let len = data.len();
     if len < 13 { return None; }
@@ -2233,63 +2233,23 @@ pub fn find_riven_validity_va(pid: u32) -> Option<usize> {
 /// pattern sits in the game's executable mappings. Those are exactly the
 /// mappings the inventory scan skips, so this is the one caller that asks the
 /// walk for executable memory.
-/// Address span of the game's own module, from the mappings procfs attributes
-/// to `Warframe.x64.exe`.
-///
-/// Wine does not leave the executable's code file-backed — only the PE headers
-/// and one data section keep the pathname, while `.text` becomes a large
-/// anonymous executable mapping wedged between them. So the module is
-/// identified by the span its named mappings bracket, not by file backing.
+// Pattern D-2 does not locate a usable riven flag under Proton. Measured against
+// the running game: the game module contains exactly one matching site, and the
+// byte it points at reads 1 both with a riven reroll screen open and with the
+// player back in the orbiter, so it cannot tell the two apart. Reporting it
+// anyway would leave `read_riven_flag_byte` permanently fail-open and fire a
+// riven-screen-open event that never closes.
+//
+// Finding the flag on Linux needs a fresh differential search rather than a port
+// of the Windows pattern. Note for whoever does that: Wine does not leave the
+// executable's code file-backed — only the PE headers and one data section keep
+// the pathname in `/proc/<pid>/maps`, while `.text` is a large anonymous
+// executable mapping between them — so the module has to be identified by the
+// span its named mappings bracket, not by file backing.
+//
+// ponytail: riven screen detection on Linux still comes from EE.log only.
 #[cfg(target_os = "linux")]
-fn linux_game_image_span(pid: u32) -> Option<std::ops::Range<usize>> {
-    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
-    let mut span: Option<std::ops::Range<usize>> = None;
-    for line in maps.lines() {
-        if !line.to_ascii_lowercase().ends_with("warframe.x64.exe") {
-            continue;
-        }
-        let mut fields = line.split_whitespace();
-        let (start, end) = fields.next()?.split_once('-')?;
-        let (start, end) = (
-            usize::from_str_radix(start, 16).ok()?,
-            usize::from_str_radix(end, 16).ok()?,
-        );
-        span = Some(match span {
-            Some(current) => current.start.min(start)..current.end.max(end),
-            None => start..end,
-        });
-    }
-    span
-}
-
-// ponytail: the Proton match is unverified — the byte reads non-zero with no
-// riven screen open, so confirm against an actual reroll screen before wiring
-// `start_riven_memory_watcher` up to anything on Linux.
-#[cfg(target_os = "linux")]
-pub fn find_riven_validity_va(pid: u32) -> Option<usize> {
-    const MIN_PATTERN: usize = 13;
-    const MAX_IMAGE: usize = 64 * 1024 * 1024;
-
-    let span = linux_game_image_span(pid)?;
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let mut result = None;
-    let walk = walk_linux_regions(
-        pid,
-        |region| {
-            region.executable
-                && span.contains(&region.start)
-                && (MIN_PATTERN..=MAX_IMAGE).contains(&region.len)
-        },
-        deadline,
-        |address, data| {
-            result = find_pattern_d2(data, address);
-            result.is_none()
-        },
-    );
-    walk.ok()?;
-    result
-}
+pub fn find_riven_validity_va(_pid: u32) -> Option<usize> { None }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub fn find_riven_validity_va(_pid: u32) -> Option<usize> { None }
