@@ -2233,23 +2233,102 @@ pub fn find_riven_validity_va(pid: u32) -> Option<usize> {
 /// pattern sits in the game's executable mappings. Those are exactly the
 /// mappings the inventory scan skips, so this is the one caller that asks the
 /// walk for executable memory.
-// Pattern D-2 does not locate a usable riven flag under Proton. Measured against
-// the running game: the game module contains exactly one matching site, and the
-// byte it points at reads 1 both with a riven reroll screen open and with the
-// player back in the orbiter, so it cannot tell the two apart. Reporting it
-// anyway would leave `read_riven_flag_byte` permanently fail-open and fire a
-// riven-screen-open event that never closes.
-//
-// Finding the flag on Linux needs a fresh differential search rather than a port
-// of the Windows pattern. Note for whoever does that: Wine does not leave the
-// executable's code file-backed — only the PE headers and one data section keep
-// the pathname in `/proc/<pid>/maps`, while `.text` is a large anonymous
-// executable mapping between them — so the module has to be identified by the
-// span its named mappings bracket, not by file backing.
-//
-// ponytail: riven screen detection on Linux still comes from EE.log only.
+/// Address span of the game's own module, from the mappings procfs attributes
+/// to `Warframe.x64.exe`.
+///
+/// Wine does not leave the executable's code file-backed — only the PE headers
+/// and one data section keep the pathname, while `.text` becomes a large
+/// anonymous executable mapping wedged between them. So the module is
+/// identified by the span its named mappings bracket, not by file backing.
 #[cfg(target_os = "linux")]
-pub fn find_riven_validity_va(_pid: u32) -> Option<usize> { None }
+fn linux_game_image_span(pid: u32) -> Option<std::ops::Range<usize>> {
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
+    let mut span: Option<std::ops::Range<usize>> = None;
+    for line in maps.lines() {
+        if !line.to_ascii_lowercase().ends_with("warframe.x64.exe") {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let (start, end) = fields.next()?.split_once('-')?;
+        let (start, end) = (
+            usize::from_str_radix(start, 16).ok()?,
+            usize::from_str_radix(end, 16).ok()?,
+        );
+        span = Some(match span {
+            Some(current) => current.start.min(start)..current.end.max(end),
+            None => start..end,
+        });
+    }
+    span
+}
+
+/// Locate the byte the game sets while a riven reroll's A/B selection screen is
+/// up. Non-zero = selection pending, which is the same event the EE.log
+/// `omegarerollselection.swf` line reports.
+///
+/// This is not the Windows Pattern D-2 scan. That pattern matches exactly one
+/// site under Proton, and the byte it resolves to reads 1 in the orbiter, in
+/// the mod segment and on the reroll screen alike, so it cannot drive the
+/// watcher. The signature below was found by diffing the game's writable
+/// statics across those states against the live game, and the surviving byte
+/// was confirmed to be 0 everywhere except while the A/B screen is up.
+///
+/// It matches the store the game publishes the state with:
+///
+/// ```text
+/// 44 87 35 <disp32>    xchg dword ptr [rip+disp], r14d
+/// 41 83 fe 01          cmp  r14d, 1
+/// ```
+///
+/// Only the displacement varies, and it appeared exactly once in the whole
+/// process, so the first match is taken.
+///
+/// ponytail: a byte signature tracks one game build; if riven detection stops
+/// working after an update, re-run `examples/riven_flag_hunt.rs` to find the
+/// flag again rather than guessing at the pattern.
+#[cfg(target_os = "linux")]
+pub fn find_riven_validity_va(pid: u32) -> Option<usize> {
+    const STORE: [u8; 3] = [0x44, 0x87, 0x35];
+    const COMPARE: [u8; 4] = [0x41, 0x83, 0xfe, 0x01];
+    // Bytes from the start of the store up to the end of its displacement,
+    // which is where the RIP-relative address is measured from.
+    const STORE_LEN: usize = 7;
+
+    let span = linux_game_image_span(pid)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut result = None;
+
+    // The game's code is one mapping well under the walk's chunk size, so a
+    // signature cannot be split across two chunks here.
+    let walk = walk_linux_regions(
+        pid,
+        |region| region.executable && span.contains(&region.start),
+        deadline,
+        |address, data| {
+            for index in 0..data.len().saturating_sub(STORE_LEN + COMPARE.len()) {
+                if data[index..index + STORE.len()] != STORE {
+                    continue;
+                }
+                if data[index + STORE_LEN..index + STORE_LEN + COMPARE.len()] != COMPARE {
+                    continue;
+                }
+                let displacement = i32::from_le_bytes(
+                    data[index + STORE.len()..index + STORE_LEN]
+                        .try_into()
+                        .expect("displacement is four bytes"),
+                ) as i64;
+                let flag = (address + index + STORE_LEN) as i64 + displacement;
+                if flag > 0x10000 && flag < 0x7fff_ffff_ffff {
+                    result = Some(flag as usize);
+                    return false;
+                }
+            }
+            true
+        },
+    );
+    walk.ok()?;
+    result
+}
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub fn find_riven_validity_va(_pid: u32) -> Option<usize> { None }
