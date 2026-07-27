@@ -2537,6 +2537,124 @@ mod tesseract_tests {
         assert!(reads_as_words("| Gauss Prime Chassis"));
         assert!(reads_as_words("MR11"));
     }
+
+    // ==========================================================================
+    // Reward extraction corpus
+    // ==========================================================================
+    //
+    // Everything above this line pins one component in isolation. This runs the
+    // whole reward pipeline — capture-shaped pixels in, item names out — over
+    // labelled screenshots of real reward screens, which is the only way to tell
+    // whether a change to bar detection or catalog scoring actually helps.
+
+    /// Images the pipeline currently gets wrong, with the reason. Listed rather
+    /// than ignored so the test fails in BOTH directions: a regression adds an
+    /// entry, and fixing a bug without deleting its entry is also a failure.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    const KNOWN_MISSES: &[(&str, &str)] = &[];
+
+    /// End-to-end reward extraction against the labelled corpus.
+    ///
+    /// The corpus is not vendored: it is megabytes of real reward screens that
+    /// already live in the sibling `wfinfo-ng` checkout, so the test skips when
+    /// it is missing rather than failing. `WFINFO_TEST_IMAGES` overrides the
+    /// location. Expect roughly one OCR pass per image — this is the slow test.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn reward_extraction_matches_the_labelled_corpus() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("WFINFO_TEST_IMAGES").unwrap_or_else(|_| {
+                format!("{}/../../wfinfo-ng/test-images", env!("CARGO_MANIFEST_DIR"))
+            }),
+        );
+        let manifest = match std::fs::read_to_string(dir.join("manifest.json")) {
+            Ok(m) => m,
+            Err(_) => {
+                eprintln!(
+                    "skipping: no reward corpus at {} (set WFINFO_TEST_IMAGES)",
+                    dir.display()
+                );
+                return;
+            }
+        };
+        let manifest: serde_json::Value =
+            serde_json::from_str(&manifest).expect("corpus manifest is JSON we generated");
+        let images = manifest["images"]
+            .as_object()
+            .expect("corpus manifest always has an images object");
+
+        // Nothing in the pipeline reads a unique name — it is only the key it
+        // looks the display name back up by — so each name doubles as its key.
+        let catalog: Vec<(String, String)> =
+            include_str!("../tests/fixtures/relic_rewards.txt")
+                .lines()
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|n| (n.to_string(), n.to_string()))
+                .collect();
+
+        // The corpus labels a 2× Forma card "Forma Blueprint" while the catalog
+        // carries a distinct "2X Forma Blueprint" entry that the pipeline
+        // correctly prefers. Fold the two together instead of recording a miss
+        // for an answer that is more precise than the label.
+        let fold = |n: &str| n.trim_start_matches("2X ").to_string();
+
+        let mut misses: Vec<(String, String)> = Vec::new();
+        for (file, spec) in images {
+            let image = match tauri::image::Image::from_path(dir.join(file)) {
+                Ok(i) => i,
+                Err(e) => panic!("corpus image {file} does not decode: {e}"),
+            };
+            let (width, full_h) = (image.width(), image.height());
+
+            // Match what the live capture hands the pipeline: BGRA for the top
+            // 80% of the game window. Bar detection reads absolute proportions,
+            // so a full-height frame would not exercise the real geometry.
+            let mut bgra = image.rgba().to_vec();
+            for px in bgra.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            let cap_h = ((full_h as f32 * 0.80) as u32).max(1);
+            bgra.truncate((width * cap_h * 4) as usize);
+
+            // The squad size is what the live path gets from EE.log; the corpus
+            // has no player names to filter out.
+            let hint_squad = spec["reward_count"].as_u64().map(|n| n as usize);
+            let (_, _, items, _, diag) = extract_reward_items_twophase(
+                &bgra, width, cap_h, full_h, &catalog, file, hint_squad, &[],
+            );
+
+            let mut got: Vec<String> = items.iter().map(|n| fold(n)).collect();
+            let mut want: Vec<String> = spec["items"]
+                .as_array()
+                .expect("every corpus entry lists its items")
+                .iter()
+                .map(|v| fold(v.as_str().expect("item names are strings")))
+                .collect();
+            // Compare as a multiset: which column a name landed in is a separate
+            // concern, and a crossed pair still changes the names themselves.
+            got.sort();
+            want.sort();
+            if got != want {
+                misses.push((
+                    file.clone(),
+                    format!("wanted {want:?}, got {got:?}\n{diag}"),
+                ));
+            }
+        }
+
+        let mut missed: Vec<&str> = misses.iter().map(|(f, _)| f.as_str()).collect();
+        let mut known: Vec<&str> = KNOWN_MISSES.iter().map(|(f, _)| *f).collect();
+        missed.sort();
+        known.sort();
+        for (file, detail) in &misses {
+            eprintln!("── {file}\n{detail}");
+        }
+        assert_eq!(
+            missed, known,
+            "corpus results moved; see the per-image detail above. \
+             Known misses and their causes: {KNOWN_MISSES:?}"
+        );
+    }
 }
 
 #[cfg(test)]
