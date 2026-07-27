@@ -2091,6 +2091,14 @@ fn parse_stat_groups(s: &str) -> Vec<Vec<String>> {
     all
 }
 
+/// Whether `text` (already lowercased) carries the riven screen's "FITS IN"
+/// panel label. The label is small enough on a 4K frame that Tesseract closes
+/// the word gap and reports "FITSIN", so both sides are compared with spaces
+/// removed — matching the spaced form alone rejected every screen tested.
+fn says_fits_in(text: &str) -> bool {
+    text.replace(' ', "").contains("fitsin")
+}
+
 /// Rejoin a riven card's OCR text into one line per stat.
 ///
 /// A stat starts with `+<digit>`, `-<digit>` or `x<digit>`; the digit matters
@@ -2457,6 +2465,7 @@ async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
 
     let mut text = String::new();
     let mut full_text_for_fallback = String::new();
+    let mut panel_for_weapon = String::new();
     let mut confirmed = false;
 
     for attempt in 0..MAX_ATTEMPTS {
@@ -2480,7 +2489,15 @@ async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
             // "FITS IN" is a two-word label in the far right panel. Over a whole
             // 4K frame it is small enough to be missed, so it gets the same
             // dedicated crop that riven_screen_visible reads it from.
-            let panel_text = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.73, 1.0, 0.30, 0.80, ocr::OcrLayout::Block)
+            //
+            // The crop runs to 95% of frame height because the weapon name sits
+            // under the panel's weapon icon at about 86% — below both this crop's
+            // old 80% bound and the full-frame pass's 82%, which is why the name
+            // was unreadable from anywhere. It is worth reaching for: the panel
+            // names the actual weapon ("Kuva Nukor") while the mod name above the
+            // card gives only the base weapon ("Nukor Crita-hexapha"), and the two
+            // carry different riven dispositions.
+            let panel_text = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.73, 1.0, 0.30, 0.95, ocr::OcrLayout::Block)
                 .unwrap_or_default();
             let _ = append_to_file(&riven_log2, &format!(
                 "[STEP 2] OCR attempt {} — {}\n├─ Full text:\n{}\n├─ Panel text:\n{}\n└─ Card text:\n{}\n\n",
@@ -2492,8 +2509,7 @@ async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
         let (full_text, panel_text, card_text) = attempt_result;
         let lower = full_text.to_lowercase();
         let has_header  = lower.contains("inventory") || lower.contains("mods");
-        let has_fits_in = lower.contains("fits in")
-            || panel_text.to_lowercase().contains("fits in");
+        let has_fits_in = says_fits_in(&lower) || says_fits_in(&panel_text.to_lowercase());
 
         let _ = append_to_file(&riven_log, &format!(
             "[STEP 2] attempt {} — header={} fits_in={}\n",
@@ -2511,6 +2527,7 @@ async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
         if (has_header && has_fits_in) || (has_header && comparison_likely) {
             text = card_text;
             full_text_for_fallback = full_text;
+            panel_for_weapon = panel_text;
             confirmed = true;
             if comparison_likely && !has_fits_in {
                 let _ = append_to_file(&riven_log, &format!(
@@ -2521,6 +2538,7 @@ async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
         }
         text = card_text;
         full_text_for_fallback = full_text;
+        panel_for_weapon = panel_text;
     }
 
     if !confirmed {
@@ -2602,13 +2620,20 @@ async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
         None
     };
 
-    let weapon = lines.iter().enumerate()
-        .find(|(_, l)| l.to_lowercase().contains("fits in"))
-        .and_then(|(i, _)| lines.get(i + 1))
-        .and_then(|l| {
-            let lc = l.trim().to_lowercase();
-            find_in_db(&lc).or(Some(lc))
-        })
+    // The "FITS IN" panel is the only place the game states the weapon outright,
+    // and it states the real one: a Kuva Nukor riven is titled "Nukor Crita-
+    // hexapha" above the card, which resolves to the ordinary Nukor and its
+    // different disposition. Take any panel line the database recognises — the
+    // surrounding panel chrome ("SHOW RANKED", icon debris) matches nothing.
+    let weapon = panel_for_weapon.lines()
+        .find_map(|l| find_in_db(&l.trim().to_lowercase()))
+        .or_else(|| lines.iter().enumerate()
+            .find(|(_, l)| says_fits_in(&l.to_lowercase()))
+            .and_then(|(i, _)| lines.get(i + 1))
+            .and_then(|l| {
+                let lc = l.trim().to_lowercase();
+                find_in_db(&lc).or(Some(lc))
+            }))
         // Fallback: first non-stat, non-UI line is the mod name "WeaponName RivenId".
         // Only accept if it matches a weapon in the DB — avoids returning currency values
         // like "D '5,598" (Endo count) that pass the basic filter.
@@ -8885,6 +8910,15 @@ X N,
             join_wrapped_stat_lines("+50% Critical Chance\nMR-1\n"),
             vec!["+50% Critical Chance"]
         );
+    }
+
+    /// Tesseract closes the gap in the panel label on every screen tested.
+    #[test]
+    fn the_fits_in_marker_is_matched_without_its_space() {
+        assert!(says_fits_in("fitsin"));
+        assert!(says_fits_in("fits in"));
+        assert!(says_fits_in("e\nfitsin\nkuva bramma"));
+        assert!(!says_fits_in("inventory/mods"));
     }
 
     /// Titles must not glue onto a stat, and a negative stat is a real curse
