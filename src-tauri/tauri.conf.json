@@ -67,14 +67,12 @@
     "linux": {
       "deb": {
         "depends": [
-          "libtesseract5",
-          "tesseract-ocr-eng"
+          "libtesseract5"
         ]
       },
       "rpm": {
         "depends": [
-          "tesseract",
-          "tesseract-langpack-eng"
+          "tesseract"
         ]
       }
     }

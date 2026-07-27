@@ -2273,6 +2273,31 @@ fn reads_as_words(text: &str) -> bool {
         .any(|token| token.len() >= 3)
 }
 
+/// Directory holding the language model shipped with the app, when there is one.
+///
+/// Empty for a `cargo run` build, which falls back to whatever model the system
+/// has installed. Every bundle carries its own copy, so this is only unset when
+/// the app is run straight out of the build directory.
+#[cfg(target_os = "linux")]
+static BUNDLED_TESSDATA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Point Tesseract at the app's own copy of the language model.
+///
+/// Without this, OCR fails to initialise on any host that has not installed
+/// Tesseract's English data separately, which no Linux bundle can guarantee.
+/// Called once at startup with the bundle's resource directory; a
+/// directory without the model in it is ignored, so a build that skipped the
+/// fetch still runs against the system copy rather than failing outright.
+#[cfg(target_os = "linux")]
+pub fn use_bundled_tessdata(resource_dir: &std::path::Path) {
+    let dir = resource_dir.join("tessdata");
+    if dir.join("eng.traineddata").is_file() {
+        if let Some(dir) = dir.to_str() {
+            let _ = BUNDLED_TESSDATA.set(dir.to_string());
+        }
+    }
+}
+
 /// Run Tesseract over one 8-bit sample per pixel.
 #[cfg(target_os = "linux")]
 fn recognize_samples(
@@ -2283,16 +2308,9 @@ fn recognize_samples(
 ) -> Result<(String, Vec<(String, f32, f32)>), String> {
     use tesseract::{PageSegMode, Tesseract};
 
-    let mut engine = Tesseract::new(None, Some("eng"))
+    let mut engine = Tesseract::new(BUNDLED_TESSDATA.get().map(String::as_str), Some("eng"))
         .map_err(|e| format!("Cannot initialise Tesseract (is eng.traineddata installed?): {e}"))?;
 
-    // A full game frame is not a document page: Tesseract's default layout
-    // analysis looks for columns and a reading order in scattered HUD text and
-    // drops most of it, whereas sparse mode reports every text region it finds —
-    // which is what the position-based card assignment downstream wants. A
-    // cropped region is the opposite case: it holds one block of lines, and
-    // sparse mode reads nothing at all from a riven card that single-block mode
-    // transcribes exactly.
     engine.set_page_seg_mode(match layout {
         OcrLayout::Scattered => PageSegMode::PsmSparseText,
         OcrLayout::Block => PageSegMode::PsmSingleBlock,

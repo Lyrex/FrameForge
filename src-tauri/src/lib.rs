@@ -8566,6 +8566,13 @@ pub fn run() {
         .setup(|app| {
             use tauri::Manager;
 
+            // Every Linux bundle carries its own Tesseract language model. Point
+            // the OCR engine at it before anything can call it.
+            #[cfg(target_os = "linux")]
+            if let Ok(dir) = app.path().resource_dir() {
+                ocr::use_bundled_tessdata(&dir);
+            }
+
             // Spin up a tiny local HTTP server that serves cached item images from disk.
             // This is more reliable than convertFileSrc (which needs assetProtocol scope).
             // Bind the std listener here (sync) to get the port, then convert to tokio
