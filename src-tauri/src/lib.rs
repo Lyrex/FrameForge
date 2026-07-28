@@ -4829,124 +4829,64 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
     // only when the result changes (screen opens/closes or items change).
     let reward_flag   = state.monitor_active.clone();
     let reward_items  = state.wfcd_items.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let bp_items      = state.blueprint_to_result.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let relic_rewards_map = state.relic_rewards.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let wiki_names    = state.wiki_reward_names.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
-    // ── Catalog: build by display-name match, not by path ────────────────────
+    // ── Catalog: build from Relics.json reward names ─────────────────────────
     //
-    // The root cause of path-based matching failures:
-    //   WFCD relic drops store reward unique_names as /Lotus/StoreItems/Types/...
-    //   WFCD items catalog stores items as /Lotus/Types/... (no StoreItems prefix)
-    //   ExportRecipes also uses /Lotus/Types/... paths
-    //   → filter(valid_relic_rewards.contains(&i.unique_name)) finds nothing,
-    //     and the catalog ends up populated with relics instead of reward items.
-    //
-    // Name-based matching bypasses this entirely:
-    //   1. Wiki reward names  — canonical, lowercase, from Warframe Wiki (most accurate)
-    //   2. WFCD reward names  — display names from relic drops table (fallback)
-    //   3. Content filter      — all "prime" / "forma" items (last resort)
+    // relic_rewards_map is already populated from Relics.json — every name in it
+    // IS a confirmed relic reward. Start from those names and look up unique_names
+    // in the WFCD item catalog. This guarantees only actual relic rewards appear
+    // as OCR candidates, preventing false matches against items like
+    // "Titan Extractor Prime Blueprint" or "Kavasa Prime Kubrow Collar Kavasa Prime Band"
+    // that contain "prime" but are not relic rewards.
 
-    // Source 1: wiki canonical reward names (lowercase display names)
-    let mut reward_display_names: std::collections::HashSet<String> = wiki_names;
-
-    // Source 2: WFCD relic drop display names — always merged (not just fallback).
-    // Wiki parsing may miss recently-added primes; WFCD covers them.
-    for rewards in relic_rewards_map.values() {
-        for r in rewards {
-            reward_display_names.insert(r.name.to_lowercase());
-        }
-    }
-
-    let have_reward_names = !reward_display_names.is_empty();
-
-    // Filter reward_items by display name (case-insensitive).
-    // Uses filter_map so we can return a corrected display name when WFCD's name
-    // differs from the in-game reward text (e.g. "Lavos Prime Chassis" in WFCD
-    // vs "Lavos Prime Chassis Blueprint" shown on the fissure reward screen).
-    let mut catalog_pairs: Vec<(String, String)> = reward_items.iter()
-        .filter_map(|i| {
-            let lower = i.name.to_lowercase();
-            // Skip assembled warframes/weapons and relics — only parts+blueprints
-            let is_relic = lower.ends_with("intact") || lower.ends_with("exceptional")
-                || lower.ends_with("flawless") || lower.ends_with("radiant");
-            if is_relic { return None; }
-            // Built warframes/weapons are never fissure rewards (you always get parts/blueprints).
-            // Excluding them prevents "Oberon Prime" (Warframes) from beating "Oberon Prime
-            // Blueprint" when OCR misses the word "Blueprint".
-            let is_built_item = matches!(i.category.as_str(),
-                "Warframes" | "Primary" | "Secondary" | "Melee" | "Companion" |
-                "Sentinels" | "Archwing" | "Arch-Gun" | "Arch-Melee" | "Pets" | "Robotic");
-            if is_built_item { return None; }
-            // Warframe prime component blueprints (Chassis/Neuroptics/Systems Blueprint)
-            // are exclusively relic rewards. Always include them even when missing from
-            // the wiki/WFCD reward name list (newly-added primes lag behind the wiki).
-            let is_prime_wf_component = lower.contains("prime") && (
-                lower.ends_with("chassis blueprint")
-                || lower.ends_with("neuroptics blueprint")
-                || lower.ends_with("systems blueprint")
-            );
-            if is_prime_wf_component { return Some((i.unique_name.clone(), i.name.clone())); }
-            if have_reward_names {
-                if reward_display_names.contains(&lower) {
-                    return Some((i.unique_name.clone(), i.name.clone()));
-                }
-                // WFCD omits "Blueprint" from some component names that the in-game reward
-                // screen includes (e.g. WFCD "Lavos Prime Chassis" vs in-game
-                // "Lavos Prime Chassis Blueprint").  If appending " blueprint" hits a
-                // known relic reward, include the item with the corrected display name
-                // so OCR scoring works against the actual card text.
-                let lower_bp = format!("{} blueprint", lower);
-                if reward_display_names.contains(&lower_bp) {
-                    return Some((i.unique_name.clone(), format!("{} Blueprint", i.name)));
-                }
-                None
-            } else {
-                // Last resort: everything that looks like a relic reward
-                if lower.contains("prime") || lower.starts_with("forma") {
-                    Some((i.unique_name.clone(), i.name.clone()))
-                } else {
-                    None
-                }
-            }
-        })
+    // Collect all reward display names (lowercase) from Relics.json + wiki corrections.
+    let reward_display_names: std::collections::HashSet<String> = relic_rewards_map
+        .values()
+        .flat_map(|rewards| rewards.iter().map(|r| r.name.to_lowercase()))
+        .chain(wiki_names.iter().cloned())
         .collect();
 
-    // Also pull blueprints from ExportRecipes that match reward names
-    for (bp_unique, (bp_name, _)) in bp_items.iter() {
-        let lower = bp_name.to_lowercase();
-        // Check for exact match OR for the case where the catalog already has this
-        // item with a " Blueprint" suffix appended (from the WFCD name-correction above).
-        let already = catalog_pairs.iter().any(|(_, n)| {
-            let nl = n.to_lowercase();
-            nl == lower || nl == format!("{} blueprint", lower) || format!("{} blueprint", nl) == lower
-        });
-        if already { continue; }
-        let is_prime_wf_component = lower.contains("prime") && (
-            lower.ends_with("chassis blueprint")
-            || lower.ends_with("neuroptics blueprint")
-            || lower.ends_with("systems blueprint")
-        );
-        let (include, display_name) = if is_prime_wf_component {
-            (true, bp_name.clone())
-        } else if have_reward_names {
-            if reward_display_names.contains(&lower) {
-                (true, bp_name.clone())
-            } else {
-                let lower_bp = format!("{} blueprint", lower);
-                if reward_display_names.contains(&lower_bp) {
-                    (true, format!("{} Blueprint", bp_name))
-                } else {
-                    (false, bp_name.clone())
+    // Build a lowercase-name → (unique_name, original_display_name) lookup over the WFCD
+    // item catalog. Excludes assembled warframes/weapons and relics (never relic rewards).
+    let wfcd_by_name: std::collections::HashMap<String, (String, String)> = reward_items.iter()
+        .filter(|i| {
+            let lower = i.name.to_lowercase();
+            let is_relic = lower.ends_with("intact") || lower.ends_with("exceptional")
+                || lower.ends_with("flawless") || lower.ends_with("radiant");
+            let is_built = matches!(i.category.as_str(),
+                "Warframes" | "Primary" | "Secondary" | "Melee" | "Companion" |
+                "Sentinels" | "Archwing" | "Arch-Gun" | "Arch-Melee" | "Pets" | "Robotic");
+            !is_relic && !is_built
+        })
+        .map(|i| (i.name.to_lowercase(), (i.unique_name.clone(), i.name.clone())))
+        .collect();
+
+    // For each known reward name find the WFCD unique_name.
+    // Handles the WFCD "Blueprint" suffix inconsistency in both directions:
+    //   Relics.json "Lavos Prime Chassis Blueprint" ↔ WFCD item "Lavos Prime Chassis"
+    let mut catalog_pairs: Vec<(String, String)> = reward_display_names.iter()
+        .filter_map(|reward_lower| {
+            // Exact match
+            if let Some((unique, display)) = wfcd_by_name.get(reward_lower.as_str()) {
+                return Some((unique.clone(), display.clone()));
+            }
+            // Reward has " blueprint" suffix but WFCD item doesn't
+            if let Some(stem) = reward_lower.strip_suffix(" blueprint") {
+                if let Some((unique, display)) = wfcd_by_name.get(stem) {
+                    return Some((unique.clone(), format!("{} Blueprint", display)));
                 }
             }
-        } else {
-            (lower.contains("prime") || lower.starts_with("forma"), bp_name.clone())
-        };
-        if include {
-            catalog_pairs.push((bp_unique.clone(), display_name));
-        }
-    }
+            // Reward lacks " blueprint" but WFCD item has it
+            let with_bp = format!("{} blueprint", reward_lower);
+            if let Some((unique, display)) = wfcd_by_name.get(&with_bp) {
+                return Some((unique.clone(), display.clone()));
+            }
+            // Not in WFCD item catalog — skip (no unique_name means no price/inventory data)
+            None
+        })
+        .collect();
 
     // Deduplicate by unique_name
     catalog_pairs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -5366,7 +5306,13 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                     reward_screen_active2.store(false, Ordering::SeqCst);
                     active_since = None;
                     last_dismiss_at = Some(std::time::Instant::now());
-                    session_relics.clear(); // relic prefilter: reset for next mission
+                    // Only clear relics on actual mission end. In survival fissures the reward
+                    // screen fires "shut down" after every round, but the next round's relic is
+                    // selected between that event and the relic selection screen closing. Clearing
+                    // here would leave session_relics empty for every round after the first.
+                    if lower.contains("matchingservice::endsession") {
+                        session_relics.clear();
+                    }
 
                     // ── Immediate inventory update from EE.log reward line ────────
                     // "gets reward /Lotus/StoreItems/..." fires when the player
@@ -7816,13 +7762,15 @@ fn load_relics_run_cache(path: &PathBuf) -> Option<(HashMap<String, u32>, HashMa
     Some((by_name, by_slug))
 }
 
-/// Fetch items.json + today's price_history from relics.run.
+const PRICING_BASE: &str = "https://raw.githubusercontent.com/WyrmStudios/FrameForgePricing/main";
+
+/// Fetch items.json + today's price_history from the FrameForgePricing mirror.
 /// Returns (by_name, by_slug):
 ///   by_name: item display name (lowercase) → median sell price  (for get_item_price)
 ///   by_slug: authoritative WFM slug         → median sell price  (for wfm_price_cache)
 fn fetch_relics_run_data() -> (HashMap<String, u32>, HashMap<String, u32>) {
     // items.json gives the authoritative name → WFM slug mapping for every tradeable item.
-    let name_to_slug: HashMap<String, String> = ureq::get("https://relics.run/items.json")
+    let name_to_slug: HashMap<String, String> = ureq::get(&format!("{}/items.json", PRICING_BASE))
         .call().ok()
         .and_then(|r| r.into_json::<Vec<serde_json::Value>>().ok())
         .unwrap_or_default()
@@ -7834,9 +7782,8 @@ fn fetch_relics_run_data() -> (HashMap<String, u32>, HashMap<String, u32>) {
         })
         .collect();
 
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let price_json: serde_json::Value = ureq::get(
-        &format!("https://relics.run/history/price_history_{}.json", today)
+        &format!("{}/price_history_latest.json", PRICING_BASE)
     ).call().ok().and_then(|r| r.into_json().ok()).unwrap_or_default();
 
     let mut by_name: HashMap<String, u32> = HashMap::new();
@@ -8222,7 +8169,35 @@ fn restore_window_state(app: &tauri::AppHandle, window: &tauri::WebviewWindow, s
     }
     if let (Some(w), Some(h)) = (w, h) {
         if w >= min_w && h >= min_h {
-            let _ = window.set_size(tauri::PhysicalSize::new(w, h));
+            // Clamp to the monitor that contains the window's top-left corner so the
+            // bottom edge never ends up off-screen (e.g. a session saved on a 1440p monitor
+            // restored on a 768p monitor would otherwise put the bottom 432px off-screen,
+            // making the scrollbar unreachable and the bottom of every page inaccessible).
+            let monitors = app.available_monitors().unwrap_or_default();
+            let wx = x.unwrap_or(0);
+            let wy = y.unwrap_or(0);
+            let max_h = monitors.iter()
+                .find(|m| {
+                    let mp = m.position();
+                    let ms = m.size();
+                    wx >= mp.x as i64 && wx < (mp.x as i64 + ms.width as i64) &&
+                    wy >= mp.y as i64 && wy < (mp.y as i64 + ms.height as i64)
+                })
+                .map(|m| {
+                    // Leave 60px for the Windows taskbar (physical pixels, before DPI scale).
+                    m.size().height.saturating_sub(60)
+                });
+            let clamped_h = if let Some(max) = max_h { h.min(max) } else { h };
+            let max_w = monitors.iter()
+                .find(|m| {
+                    let mp = m.position();
+                    let ms = m.size();
+                    wx >= mp.x as i64 && wx < (mp.x as i64 + ms.width as i64) &&
+                    wy >= mp.y as i64 && wy < (mp.y as i64 + ms.height as i64)
+                })
+                .map(|m| m.size().width);
+            let clamped_w = if let Some(max) = max_w { w.min(max) } else { w };
+            let _ = window.set_size(tauri::PhysicalSize::new(clamped_w, clamped_h));
         }
     }
 }

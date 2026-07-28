@@ -729,9 +729,12 @@ fn word_found_in_set(
             let len_diff = (catalog_word.len() as isize - ocr_w.len() as isize).unsigned_abs();
             if dist <= max_dist && !(len_diff == dist && len_diff >= 2) { return true; }
         }
-        // Sliding window (merged tokens — e.g. OCR reads "SevagothPrime" as one word)
+        // Sliding window (merged tokens — e.g. OCR reads "SevagothPrime" as one word).
+        // Require the OCR token to be at least 4 chars longer than the catalog word so
+        // standalone words that differ by 1 char (e.g. "band" ↔ "hand" inside "handle")
+        // don't produce false matches. Genuine merges are always 4+ chars longer.
         let ob = ocr_w.as_bytes();
-        if ob.len() >= wb.len() {
+        if ob.len() >= wb.len() + 4 {
             for (win_start, win) in ob.windows(wb.len()).enumerate() {
                 let errs = wb.iter().zip(win.iter()).filter(|(a, b)| a != b).count();
                 // Guard: reject exact suffix matches where the catalog word cleanly
@@ -1220,7 +1223,12 @@ fn build_word_set(texts: &[String]) -> std::collections::HashSet<String> {
 
 fn score_item(display_name: &str, words: &std::collections::HashSet<String>) -> f32 {
     let norm = normalise(display_name);
-    let item_words: Vec<&str> = norm.split_whitespace().collect();
+    // Deduplicate so repeated words (e.g. "prime" twice in "Kavasa Prime Kubrow Collar Kavasa
+    // Prime Band") don't inflate the matched/n_ocr ratio and outscore shorter correct matches.
+    let mut seen = std::collections::HashSet::new();
+    let item_words: Vec<&str> = norm.split_whitespace()
+        .filter(|&w| seen.insert(w))
+        .collect();
     if item_words.is_empty() { return 0.0; }
     let n_catalog = item_words.len() as f32;
     let n_ocr = words.len() as f32;

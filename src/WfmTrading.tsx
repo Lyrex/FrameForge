@@ -631,10 +631,16 @@ function MessagesPanel({ username: _username, wfmItems }: { username: string; wf
   // Auto-complete a matching whisper when an in-game trade finishes.
   useEffect(() => {
     const unlisten = listen<{
-      withPlayer: string; direction: string; itemName: string;
-      quantity: number; platinum: number; timestamp: string;
+      sessionId: string;
+      withPlayer: string;
+      tradeType: "sale" | "purchase" | "trade";
+      offeredItems: { name: string; qty: number }[];
+      offeredPlat: number;
+      receivedItems: { name: string; qty: number }[];
+      receivedPlat: number;
+      timestamp: string;
     }>("trade-completed", (e) => {
-      const { withPlayer, direction, itemName, quantity } = e.payload;
+      const { withPlayer, tradeType, offeredItems } = e.payload;
 
       // Phase 1: immediately mark the ghost (synchronous state update)
       let matchedFrom: string | null = null;
@@ -665,53 +671,60 @@ function MessagesPanel({ username: _username, wfmItems }: { username: string; wf
         return updated;
       });
 
-      // Phase 2: update WFM listing and attach revert info (async, only for sales)
-      if (direction === "sold") {
+      // Phase 2: update WFM listings and attach revert info (async, only for sales)
+      if (tradeType === "sale") {
         (async () => {
           try {
             const allOrders = await invokeWfm<WfmOrder[]>("wfm_get_orders");
             const sellOrders = (allOrders ?? []).filter(o => o.type === "sell");
             const idMap = itemIdMapRef.current;
-            const tradeLower = itemName.toLowerCase();
 
-            // Match by display name — exact first, then substring
-            const match = sellOrders.find(o => orderName(o, idMap).toLowerCase() === tradeLower)
-              ?? sellOrders.find(o => {
-                const n = orderName(o, idMap).toLowerCase();
-                return n.includes(tradeLower) || tradeLower.includes(n);
+            // Process each sold item — decrement or delete its listing
+            for (const soldItem of offeredItems) {
+              const tradeLower = soldItem.name.toLowerCase();
+
+              // Match by display name — exact first, then substring
+              const match = sellOrders.find(o => orderName(o, idMap).toLowerCase() === tradeLower)
+                ?? sellOrders.find(o => {
+                  const n = orderName(o, idMap).toLowerCase();
+                  return n.includes(tradeLower) || tradeLower.includes(n);
+                });
+
+              if (!match) continue;
+
+              const originalQty = match.quantity;
+              const newQty      = Math.max(0, originalQty - soldItem.qty);
+              const itemId      = (match as unknown as Record<string, unknown>).itemId as string | undefined ?? "";
+
+              const revertInfo: NonNullable<WfmWhisper["revertInfo"]> = {
+                orderId: match.id,
+                itemId,
+                platinum: match.platinum,
+                originalQty,
+                newQty,
+                visible: match.visible,
+              };
+
+              if (newQty > 0) {
+                await invokeWfm("wfm_update_order", { orderId: match.id, platinum: match.platinum, quantity: newQty, visible: match.visible });
+              } else {
+                await invokeWfm("wfm_delete_order", { orderId: match.id });
+              }
+
+              // Attach revertInfo to the ghost for the first matched item
+              setWhispers(prev => {
+                const idx = prev.findIndex(
+                  w => w.completedAt && w.from === (matchedFrom ?? withPlayer) && !w.revertInfo
+                );
+                if (idx === -1) return prev;
+                const updated = [...prev];
+                updated[idx] = { ...updated[idx], revertInfo };
+                return updated;
               });
 
-            if (!match) return;
-
-            const originalQty = match.quantity;
-            const newQty      = Math.max(0, originalQty - quantity);
-            const itemId      = (match as unknown as Record<string, unknown>).itemId as string | undefined ?? "";
-
-            const revertInfo: NonNullable<WfmWhisper["revertInfo"]> = {
-              orderId: match.id,
-              itemId,
-              platinum: match.platinum,
-              originalQty,
-              newQty,
-              visible: match.visible,
-            };
-
-            if (newQty > 0) {
-              await invokeWfm("wfm_update_order", { orderId: match.id, platinum: match.platinum, quantity: newQty, visible: match.visible });
-            } else {
-              await invokeWfm("wfm_delete_order", { orderId: match.id });
+              // Mark this order as processed so subsequent items don't match it again
+              match.quantity = newQty;
             }
-
-            // Phase 2 state update: attach revertInfo to the ghost
-            setWhispers(prev => {
-              const idx = prev.findIndex(
-                w => w.completedAt && w.from === (matchedFrom ?? withPlayer) && !w.revertInfo
-              );
-              if (idx === -1) return prev;
-              const updated = [...prev];
-              updated[idx] = { ...updated[idx], revertInfo };
-              return updated;
-            });
           } catch (err) {
             console.warn("[trade-completed] WFM order update failed:", err);
           }

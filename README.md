@@ -1,4 +1,4 @@
-# FrameForge — Warframe Companion `v2.6.0`
+# FrameForge — Warframe Companion `v2.7.0`
 
 A desktop companion for Warframe — live inventory, market prices, trading, timers, relic overlay, and riven analysis. Read-only, no game modification.
 
@@ -9,7 +9,7 @@ A desktop companion for Warframe — live inventory, market prices, trading, tim
 ## Features
 
 ### Live Inventory
-Reads your inventory directly from Warframe's process memory (read-only, same API as Overwolf). Instead of scanning for individual item patterns, FrameForge now locates and captures the full account JSON blob that the game client holds in memory — the same authoritative data the game itself uses.
+Reads your inventory directly from Warframe's process memory (read-only, same API as Overwolf). Instead of scanning for individual item patterns, FrameForge locates and captures the full account JSON blob that the game client holds in memory — the same authoritative data the game itself uses.
 
 This gives complete coverage: resources, mods, arcanes, relics, weapons, Warframes, companions, blueprints, cosmetics (glyphs, palettes, emotes, titles, ship skins), sigils, pending Foundry jobs, credits, and more. Items that leave your inventory (traded, consumed, or expired) are correctly detected as dropped to zero. Inventory is persisted to disk and restored instantly on next launch — no login required.
 
@@ -17,7 +17,7 @@ This gives complete coverage: resources, mods, arcanes, relics, weapons, Warfram
 Browse every craftable item with full ingredient trees. Components are colour-coded by ownership status and show which relics drop them. Star items to track them in the Modular Window. Filter by Prime, Vaulted/Unvaulted, Owned/Unowned, Ready to build, and Mastered/Unmastered.
 
 ### Market Helper
-Browse Prime sets and mods with live platinum prices from [warframe.market](https://warframe.market). Prices are loaded from the [relics.run](https://relics.run) daily bulk cache on startup — no per-item network calls needed. Click any item for a live order popup with sell/buy orders, 3-week price chart, and one-click listing (requires WFM login). Mod cards show per-rank chips — click a chip to pre-fill the listing form with that exact rank and quantity. A **rank selector** in the orders popup filters listings to a specific mod/arcane rank.
+Browse Prime sets and mods with live platinum prices from [warframe.market](https://warframe.market). Prices are loaded from the [FrameForgePricing](https://github.com/WyrmStudios/FrameForgePricing) mirror on startup — a daily bulk cache updated twice per day from relics.run. No per-item network calls needed. Click any item for a live order popup with sell/buy orders, 3-week price chart, and one-click listing (requires WFM login). Mod cards show per-rank chips — click a chip to pre-fill the listing form with that exact rank and quantity. A **rank selector** in the orders popup filters listings to a specific mod/arcane rank.
 
 **Recipe-aware duplication detection** — multi-count recipes (e.g. Aksomati Prime requires 2× Barrel) are respected when calculating sellable duplicates and the "Has dupes" filter.
 
@@ -48,7 +48,7 @@ Live dashboard from DE's worldstate API:
 - Alerts, Invasions, Void Fissures with configurable fissure watches
 
 ### Statistics
-- **Trades** — auto-detected from EE.log. Now captures all items from both sides of every trade, including item-for-item barters (no platinum involved). Each trade is classified as Sale, Purchase, or Trade.
+- **Trades** — auto-detected from EE.log. Captures all items from both sides of every trade, including item-for-item barters (no platinum involved). Each trade is classified as Sale, Purchase, or Trade.
 - **Trade Log** — individual trade cards showing the full exchange: what you gave, what you received, with which player, and when. Toggle between Log and Analytics views in the Reports tab.
 - **Reports** — date-filtered KPIs, platinum charts, per-item breakdown, top trading partners
 - **Item Report** — track any item's quantity over time with daily snapshots and drag-to-reorder cards
@@ -58,6 +58,8 @@ Analyses riven rolls against the community-curated [44bananas spreadsheet](https
 
 ### OCR Relic Reward Overlay
 When a void fissure reward screen opens, FrameForge automatically captures it via Windows OCR and shows a transparent overlay with platinum price, ducat value, and set completion for each card. Priority mode: Completion / Plat / Ducats / Set Value.
+
+The item catalog used for OCR matching is built exclusively from known relic reward names — no false matches from non-reward items. Survival fissure multi-round sessions are fully supported: the selected relic carries over between rounds correctly.
 
 ### Modular Window
 Customisable sidebar with reorderable sections: tracked crafting items, favourite inventory items, pinned timers, and watched fissures.
@@ -85,7 +87,7 @@ Everything else (Foundry, Market, Relics, Timers, Statistics) runs on public dat
 |---|---|
 | Memory access | Read-only `ReadProcessMemory` — never writes, never injects |
 | Game modification | None |
-| Network | warframe.market, DE worldstate, WFCD GitHub repos. No FrameForge server, no telemetry |
+| Network | warframe.market, DE worldstate, WFCD GitHub repos, FrameForgePricing mirror. No FrameForge server, no telemetry |
 | Credentials | WFM token in Windows Credential Manager. Warframe API credentials never written to disk |
 
 Source code is fully public under GPLv3 — build and verify it yourself.
