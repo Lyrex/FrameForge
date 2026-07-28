@@ -215,14 +215,10 @@ fn preprocess_for_ocr(pixels: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, 
 
 /// OCR a rectangle from a pre-captured pixel buffer. All coordinates are 0.0–1.0 fractions.
 /// Applies a mild contrast stretch before OCR (no upscaling — upscaling distorts numerals).
-///
-/// `layout` describes what the rectangle contains: callers that crop down to one
-/// panel pass `Block`, callers that pass the whole frame pass `Scattered`. The
-/// distinction is invisible to Windows OCR and decisive for Tesseract.
+#[cfg(target_os = "windows")]
 pub fn ocr_pixels_rect(
     pixels: &[u8], full_w: u32, full_h: u32,
     x_start: f32, x_end: f32, y_start: f32, y_end: f32,
-    layout: OcrLayout,
 ) -> Result<String, String> {
     let col_s = (full_w as f32 * x_start.clamp(0.0, 1.0)) as usize;
     let col_e = ((full_w as f32 * x_end.clamp(0.0, 1.0)) as usize).min(full_w as usize);
@@ -242,15 +238,15 @@ pub fn ocr_pixels_rect(
     }
 
     let (enhanced, ew, eh) = preprocess_for_ocr(&cropped, rect_w, rect_h);
-    run_ocr(&enhanced, ew, eh, layout).map(|(text, _)| text)
+    let bmp = to_bmp(&enhanced, ew, eh);
+    run_windows_ocr(bmp, ew, eh).map(|(text, _)| text)
 }
 
 /// OCR a rectangle WITHOUT preprocessing — for white-on-dark text that OCRs fine raw.
-/// See `ocr_pixels_rect` for what `layout` selects.
+#[cfg(target_os = "windows")]
 pub fn ocr_pixels_rect_raw(
     pixels: &[u8], full_w: u32, full_h: u32,
     x_start: f32, x_end: f32, y_start: f32, y_end: f32,
-    layout: OcrLayout,
 ) -> Result<String, String> {
     let col_s = (full_w as f32 * x_start.clamp(0.0, 1.0)) as usize;
     let col_e = ((full_w as f32 * x_end.clamp(0.0, 1.0)) as usize).min(full_w as usize);
@@ -267,21 +263,108 @@ pub fn ocr_pixels_rect_raw(
         let dst = row * dst_stride;
         cropped[dst..dst + dst_stride].copy_from_slice(&pixels[src..src + dst_stride]);
     }
-    run_ocr(&cropped, rect_w, rect_h, layout).map(|(text, _)| text)
+    let bmp = to_bmp(&cropped, rect_w, rect_h);
+    run_windows_ocr(bmp, rect_w, rect_h).map(|(text, _)| text)
+}
+
+// ==============================================================================
+// Linux entry points — the same contract, a different engine
+// ==============================================================================
+//
+// These mirror the two functions above rather than sharing them. Sharing would
+// mean rewriting a function upstream actively develops, and `ocr.rs` is one of
+// the files upstream churns hardest; a duplicated crop loop costs us nothing on
+// a sync, while an edit to upstream's version costs a conflict on every one.
+// The signatures are deliberately identical to upstream's so that call sites in
+// `lib.rs` stay platform-agnostic and keep speaking upstream's 7-argument form.
+
+/// Crop a BGRA rectangle out of a full frame. Fractions, as above.
+///
+/// Returns `None` when the rectangle is under four pixels on a side, matching
+/// the "Region too small" rejection the Windows path applies.
+#[cfg(target_os = "linux")]
+fn crop_bgra(
+    pixels: &[u8], full_w: u32, full_h: u32,
+    x_start: f32, x_end: f32, y_start: f32, y_end: f32,
+) -> Option<(Vec<u8>, u32, u32)> {
+    let col_s = (full_w as f32 * x_start.clamp(0.0, 1.0)) as usize;
+    let col_e = ((full_w as f32 * x_end.clamp(0.0, 1.0)) as usize).min(full_w as usize);
+    let row_s = (full_h as f32 * y_start.clamp(0.0, 1.0)) as usize;
+    let row_e = ((full_h as f32 * y_end.clamp(0.0, 1.0)) as usize).min(full_h as usize);
+    let rect_w = (col_e - col_s) as u32;
+    let rect_h = (row_e - row_s) as u32;
+    if rect_w < 4 || rect_h < 4 {
+        return None;
+    }
+    let src_stride = full_w as usize * 4;
+    let dst_stride = rect_w as usize * 4;
+    let mut cropped = vec![0u8; dst_stride * rect_h as usize];
+    for row in 0..rect_h as usize {
+        let src = (row_s + row) * src_stride + col_s * 4;
+        let dst = row * dst_stride;
+        cropped[dst..dst + dst_stride].copy_from_slice(&pixels[src..src + dst_stride]);
+    }
+    Some((cropped, rect_w, rect_h))
+}
+
+/// Which page-segmentation mode a rectangle wants from Tesseract.
+///
+/// The hint is derived from the rectangle rather than passed in, because passing
+/// it in means adding an argument to a signature upstream owns, at every call
+/// site in `lib.rs`. Full width means the caller handed us a whole game frame —
+/// the only case that wants sparse mode. Every cropped region is a panel.
+///
+/// ponytail: heuristic stands in for an explicit parameter. It holds while
+/// "full width" and "whole frame" mean the same thing. A future caller that
+/// crops vertically but keeps the full width would read as `Scattered` and get
+/// nothing back; if that case appears, thread the layout through a Linux-only
+/// entry point rather than widening upstream's signature.
+#[cfg(target_os = "linux")]
+fn layout_for(x_start: f32, x_end: f32) -> OcrLayout {
+    if x_end - x_start >= 0.99 {
+        OcrLayout::Scattered
+    } else {
+        OcrLayout::Block
+    }
+}
+
+/// Linux twin of the Windows `ocr_pixels_rect`. Same contract, Tesseract behind it.
+#[cfg(target_os = "linux")]
+pub fn ocr_pixels_rect(
+    pixels: &[u8], full_w: u32, full_h: u32,
+    x_start: f32, x_end: f32, y_start: f32, y_end: f32,
+) -> Result<String, String> {
+    let (cropped, rect_w, rect_h) =
+        crop_bgra(pixels, full_w, full_h, x_start, x_end, y_start, y_end)
+            .ok_or_else(|| "Region too small".to_string())?;
+    let (enhanced, ew, eh) = preprocess_for_ocr(&cropped, rect_w, rect_h);
+    run_ocr(&enhanced, ew, eh, layout_for(x_start, x_end)).map(|(text, _)| text)
+}
+
+/// Linux twin of the Windows `ocr_pixels_rect_raw`.
+#[cfg(target_os = "linux")]
+pub fn ocr_pixels_rect_raw(
+    pixels: &[u8], full_w: u32, full_h: u32,
+    x_start: f32, x_end: f32, y_start: f32, y_end: f32,
+) -> Result<String, String> {
+    let (cropped, rect_w, rect_h) =
+        crop_bgra(pixels, full_w, full_h, x_start, x_end, y_start, y_end)
+            .ok_or_else(|| "Region too small".to_string())?;
+    run_ocr(&cropped, rect_w, rect_h, layout_for(x_start, x_end)).map(|(text, _)| text)
 }
 
 /// Convenience: capture + OCR a vertical strip of the window (full width).
 #[allow(dead_code)]
 pub fn capture_and_ocr_region(y_start: f32, y_end: f32) -> Result<String, String> {
     let (pixels, w, h) = capture_warframe_pixels()?;
-    ocr_pixels_rect(&pixels, w, h, 0.0, 1.0, y_start, y_end, OcrLayout::Scattered)
+    ocr_pixels_rect(&pixels, w, h, 0.0, 1.0, y_start, y_end)
 }
 
 /// Convenience: capture + OCR a specific rectangle.
 #[allow(dead_code)]
 pub fn capture_rect_and_ocr(x_start: f32, x_end: f32, y_start: f32, y_end: f32) -> Result<String, String> {
     let (pixels, w, h) = capture_warframe_pixels()?;
-    ocr_pixels_rect(&pixels, w, h, x_start, x_end, y_start, y_end, OcrLayout::Block)
+    ocr_pixels_rect(&pixels, w, h, x_start, x_end, y_start, y_end)
 }
 
 /// Captures the full Warframe window region from the desktop using GDI BitBlt.
@@ -570,96 +653,12 @@ pub fn to_bmp(pixels_bgra: &[u8], width: u32, height: u32) -> Vec<u8> {
     bmp
 }
 
-// ─── OCR line assembly (engine-independent) ───────────────────────────────────
-
-/// One recognised word, with its horizontal extent and vertical centre already
-/// expressed as fractions of the source image. Both OCR engines (WinRT on
-/// Windows, Tesseract on Linux) report pixel bounding boxes; normalising at the
-/// engine boundary lets the card-column logic downstream stay resolution- and
-/// engine-agnostic.
-pub struct OcrWord {
-    pub text: String,
-    pub x_left: f32,
-    pub x_right: f32,
-    pub cy: f32,
-}
-
-/// How much page structure the OCR engine should assume.
-///
-/// Windows OCR does its own layout analysis and ignores this; Tesseract does not,
-/// and picks up nothing at all on the wrong setting — a cropped riven card reads
-/// perfectly as one block and returns empty as scattered text, and a full reward
-/// frame does the opposite.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum OcrLayout {
-    /// Text scattered anywhere in a full game frame.
-    Scattered,
-    /// A single block of text filling a cropped region.
-    Block,
-}
-
-/// Inter-card gap: reward cards are separated by ~10–12% of image width.
-/// Word gaps within a single item name are ≤ 3%. Splitting at 7% cleanly
-/// divides "Daikyu Prime Upper Limb Nautilus Prime Systems" (which both OCR
-/// engines merge into one line when the two names share a baseline Y) into the
-/// two separate card entries the column-assignment logic expects.
-const WORD_GAP: f32 = 0.07;
-
-/// Turn engine lines into the `(full_text, positions)` pair the reward pipeline
-/// consumes, splitting any line whose internal word gap exceeds `WORD_GAP`.
-///
-/// Each returned entry is `(text, x_centre, y_centre)`, averaged over the words
-/// that make up that sub-line.
-fn assemble_ocr_lines(engine_lines: &[Vec<OcrWord>]) -> (String, Vec<(String, f32, f32)>) {
-    let mut full = String::new();
-    let mut lines_out: Vec<(String, f32, f32)> = Vec::new();
-
-    for words in engine_lines {
-        // Walk words left-to-right; flush a sub-line whenever the horizontal
-        // gap to the next word exceeds WORD_GAP.
-        let mut seg_texts: Vec<&str> = Vec::new();
-        let mut seg_sx = 0.0f32;
-        let mut seg_sy = 0.0f32;
-        let mut seg_n = 0u32;
-        let mut prev_right = -1.0f32;
-        for w in words {
-            if prev_right >= 0.0 && (w.x_left - prev_right) > WORD_GAP && !seg_texts.is_empty() {
-                let sub = seg_texts.join(" ");
-                full.push_str(&sub);
-                full.push('\n');
-                lines_out.push((sub, seg_sx / seg_n as f32, seg_sy / seg_n as f32));
-                seg_texts.clear();
-                seg_sx = 0.0;
-                seg_sy = 0.0;
-                seg_n = 0;
-            }
-            seg_texts.push(&w.text);
-            seg_sx += (w.x_left + w.x_right) / 2.0;
-            seg_sy += w.cy;
-            seg_n += 1;
-            prev_right = w.x_right;
-        }
-        if !seg_texts.is_empty() {
-            let sub = seg_texts.join(" ");
-            full.push_str(&sub);
-            full.push('\n');
-            lines_out.push((sub, seg_sx / seg_n as f32, seg_sy / seg_n as f32));
-        }
-    }
-
-    (full, lines_out)
-}
-
 // ─── Windows OCR ──────────────────────────────────────────────────────────────
 
-/// Run Windows.Media.Ocr on a BGRA buffer. Returns (full_text, line_positions).
-/// line_positions: Vec<(line_text, x_frac, y_frac)> — centre per line from word
-/// bounding rects. `BitmapDecoder` wants an encoded image, so the buffer is
-/// wrapped in a BMP here; the Linux backend takes the same buffer and hands
-/// Tesseract raw samples instead.
+/// Run Windows.Media.Ocr on a BMP. Returns (full_text, line_positions).
+/// line_positions: Vec<(line_text, x_frac)> — X centre per line from word bounding rects.
 #[cfg(target_os = "windows")]
-pub fn run_ocr(pixels_bgra: &[u8], img_w: u32, img_h: u32, _layout: OcrLayout) -> Result<(String, Vec<(String, f32, f32)>), String> {
-    let bmp = to_bmp(pixels_bgra, img_w, img_h);
+pub fn run_windows_ocr(bmp: Vec<u8>, img_w: u32, img_h: u32) -> Result<(String, Vec<(String, f32, f32)>), String> {
     // Ensure COM is initialized for this thread. Tokio spawn_blocking threads
     // start without a COM apartment; WinRT calls fail or return empty silently.
     // CoInitializeEx returns S_OK (first init), S_FALSE (already MTA), or
@@ -699,39 +698,57 @@ pub fn run_ocr(pixels_bgra: &[u8], img_w: u32, img_h: u32, _layout: OcrLayout) -
             .or_else(|_| OcrEngine::TryCreateFromUserProfileLanguages())?;
         let result = engine.RecognizeAsync(&bitmap)?.get()?;
 
+        let mut full = String::new();
+        let mut lines_out: Vec<(String, f32, f32)> = Vec::new();
         let lines: IVectorView<OcrLine> = result.Lines()?;
         let count = lines.Size()?;
-        let mut engine_lines: Vec<Vec<OcrWord>> = Vec::with_capacity(count as usize);
+        // Inter-card gap: reward cards are separated by ~10–12% of image width.
+        // Word gaps within a single item name are ≤ 3%. Splitting at 7% cleanly
+        // divides "Daikyu Prime Upper Limb Nautilus Prime Systems" (which WinRT
+        // merges into one line when both names share the same baseline Y) into the
+        // two separate card entries the column-assignment logic expects.
+        const WORD_GAP: f32 = 0.07;
         for i in 0..count {
             let line = lines.GetAt(i)?;
             let words = line.Words()?;
             let wc = words.Size()?;
             if wc == 0 {
-                // A line with text but no word boxes carries no position — centre
-                // it so the column assignment treats it as ambiguous rather than
-                // pinning it to the left edge.
-                engine_lines.push(vec![OcrWord {
-                    text: line.Text()?.to_string(),
-                    x_left: 0.5,
-                    x_right: 0.5,
-                    cy: 0.5,
-                }]);
+                let text = line.Text()?.to_string();
+                full.push_str(&text); full.push('\n');
+                lines_out.push((text, 0.5, 0.5));
                 continue;
             }
-            let mut words_out = Vec::with_capacity(wc as usize);
+            // Walk words left-to-right; flush a sub-line whenever the horizontal
+            // gap to the next word exceeds WORD_GAP.
+            let mut seg_texts: Vec<String> = Vec::new();
+            let mut seg_sx = 0.0f32;
+            let mut seg_sy = 0.0f32;
+            let mut seg_n  = 0u32;
+            let mut prev_right = -1.0f32;
             for j in 0..wc {
-                let w = words.GetAt(j)?;
-                let r = w.BoundingRect()?;
-                words_out.push(OcrWord {
-                    text: w.Text()?.to_string(),
-                    x_left: if img_w > 0 { r.X / img_w as f32 } else { 0.0 },
-                    x_right: if img_w > 0 { (r.X + r.Width) / img_w as f32 } else { 1.0 },
-                    cy: if img_h > 0 { (r.Y + r.Height / 2.0) / img_h as f32 } else { 0.5 },
-                });
+                let w  = words.GetAt(j)?;
+                let r  = w.BoundingRect()?;
+                let cx = if img_w > 0 { (r.X + r.Width  / 2.0) / img_w as f32 } else { 0.5 };
+                let cy = if img_h > 0 { (r.Y + r.Height / 2.0) / img_h as f32 } else { 0.5 };
+                let xl = if img_w > 0 { r.X / img_w as f32 } else { 0.0 };
+                let xr = if img_w > 0 { (r.X + r.Width) / img_w as f32 } else { 1.0 };
+                if prev_right >= 0.0 && (xl - prev_right) > WORD_GAP && !seg_texts.is_empty() {
+                    let sub = seg_texts.join(" ");
+                    full.push_str(&sub); full.push('\n');
+                    lines_out.push((sub, seg_sx / seg_n as f32, seg_sy / seg_n as f32));
+                    seg_texts.clear(); seg_sx = 0.0; seg_sy = 0.0; seg_n = 0;
+                }
+                seg_texts.push(w.Text()?.to_string());
+                seg_sx += cx; seg_sy += cy; seg_n += 1;
+                prev_right = xr;
             }
-            engine_lines.push(words_out);
+            if !seg_texts.is_empty() {
+                let sub = seg_texts.join(" ");
+                full.push_str(&sub); full.push('\n');
+                lines_out.push((sub, seg_sx / seg_n as f32, seg_sy / seg_n as f32));
+            }
         }
-        Ok(assemble_ocr_lines(&engine_lines))
+        Ok((full, lines_out))
     })().map_err(|e| e.to_string())
 }
 
@@ -867,6 +884,7 @@ fn normalise(s: &str) -> String {
 /// band have bar-coloured pixels. Columns that are consistently orange or teal
 /// across many rows score high. This is far more robust than row-by-row detection
 /// because it tolerates thin bars, color gradients, and single-row noise.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 /// Returns `(Some((centers, bar_y_frac)), diagnostic_string)`.
 /// `centers` are fractions of image width — the diamond icon X per card.
 /// The diagnostic string is always populated for session log inclusion.
@@ -1042,6 +1060,11 @@ fn find_rarity_bars(pixels: &[u8], pix_w: u32, pix_h: u32) -> (Option<(Vec<f32>,
     (Some((centers, bar_y)), diag)
 }
 
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn find_rarity_bars(_: &[u8], _: u32, _: u32) -> (Option<(Vec<f32>, f32)>, String) {
+    (None, "not supported on non-Windows".into())
+}
+
 // ─── Icon component classifier ────────────────────────────────────────────────
 
 /// What the card icon looks like, used to constrain catalog matching.
@@ -1084,6 +1107,7 @@ pub enum IconType {
 ///   ⑧ blade        — low symmetry, moderate aspect (flat asymmetric part)
 ///   ⑨ upper/lower limb — low fill, arc-shaped (bow components)
 ///   Unknown        — ambiguous; fall back to text-only matching
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn classify_card_icon(
     pixels: &[u8], pix_w: u32, pix_h: u32,
     x_left: f32, x_right: f32, bar_y: f32,
@@ -1217,6 +1241,11 @@ fn classify_card_icon(
         };
     }
 
+    IconType::Unknown
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn classify_card_icon(_: &[u8], _: u32, _: u32, _: f32, _: f32, _: f32) -> IconType {
     IconType::Unknown
 }
 
@@ -1357,6 +1386,7 @@ fn score_item(display_name: &str, words: &std::collections::HashSet<String>) -> 
 /// 3. Assign each OCR line to the nearest card (by X).
 /// 4. Per-card word set → prefix + fuzzy match against relic catalog.
 /// 5. Full-frame fallback if bar detection fails.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub fn extract_reward_items_twophase(
     pixels: &[u8], pix_w: u32, pix_h: u32, _game_h: u32,
     catalog: &[(String, String)],
@@ -1366,8 +1396,16 @@ pub fn extract_reward_items_twophase(
 ) -> (bool, bool, Vec<String>, Vec<f32>, String) {
 
     // ── 1. Raw OCR ────────────────────────────────────────────────────────────
+    // Each platform calls its own engine directly rather than going through a
+    // shared wrapper. Upstream's line is kept verbatim so this hunk stays a pure
+    // addition on their side of the file; the Linux arm sits beside it.
+    #[cfg(target_os = "windows")]
+    let engine_output = run_windows_ocr(to_bmp(pixels, pix_w, pix_h), pix_w, pix_h);
+    #[cfg(target_os = "linux")]
+    let engine_output = run_ocr(pixels, pix_w, pix_h, OcrLayout::Scattered);
+
     let (raw_full, ocr_lines) =
-        match run_ocr(pixels, pix_w, pix_h, OcrLayout::Scattered) {
+        match engine_output {
             Ok(r) => r,
             Err(e) => return (false, false, vec![], vec![],
                 format!("├─ Capture  : {}\n└─ OCR error: {}", capture_info, e)),
@@ -2215,6 +2253,95 @@ pub fn capture_desktop_for_diag() -> Option<(Vec<u8>, u32, u32)> {
     None
 }
 
+// ─── OCR line assembly (Linux/Tesseract) ─────────────────────────────────────
+//
+// Upstream assembles its lines inline inside `run_windows_ocr`, and that is
+// left exactly as upstream wrote it. This is the same logic re-expressed for
+// Tesseract, which reports geometry per word in TSV rather than per line.
+
+/// One recognised word, with its horizontal extent and vertical centre already
+/// expressed as fractions of the source image. Both OCR engines (WinRT on
+/// Windows, Tesseract on Linux) report pixel bounding boxes; normalising at the
+/// engine boundary lets the card-column logic downstream stay resolution- and
+/// engine-agnostic.
+#[cfg(target_os = "linux")]
+pub struct OcrWord {
+    pub text: String,
+    pub x_left: f32,
+    pub x_right: f32,
+    pub cy: f32,
+}
+
+/// How much page structure the OCR engine should assume.
+///
+/// Windows OCR does its own layout analysis and ignores this; Tesseract does not,
+/// and picks up nothing at all on the wrong setting — a cropped riven card reads
+/// perfectly as one block and returns empty as scattered text, and a full reward
+/// frame does the opposite.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OcrLayout {
+    /// Text scattered anywhere in a full game frame.
+    Scattered,
+    /// A single block of text filling a cropped region.
+    Block,
+}
+
+/// Inter-card gap: reward cards are separated by ~10–12% of image width.
+/// Word gaps within a single item name are ≤ 3%. Splitting at 7% cleanly
+/// divides "Daikyu Prime Upper Limb Nautilus Prime Systems" (which both OCR
+/// engines merge into one line when the two names share a baseline Y) into the
+/// two separate card entries the column-assignment logic expects.
+#[cfg(target_os = "linux")]
+const WORD_GAP: f32 = 0.07;
+
+/// Turn engine lines into the `(full_text, positions)` pair the reward pipeline
+/// consumes, splitting any line whose internal word gap exceeds `WORD_GAP`.
+///
+/// Each returned entry is `(text, x_centre, y_centre)`, averaged over the words
+/// that make up that sub-line.
+#[cfg(target_os = "linux")]
+fn assemble_ocr_lines(engine_lines: &[Vec<OcrWord>]) -> (String, Vec<(String, f32, f32)>) {
+    let mut full = String::new();
+    let mut lines_out: Vec<(String, f32, f32)> = Vec::new();
+
+    for words in engine_lines {
+        // Walk words left-to-right; flush a sub-line whenever the horizontal
+        // gap to the next word exceeds WORD_GAP.
+        let mut seg_texts: Vec<&str> = Vec::new();
+        let mut seg_sx = 0.0f32;
+        let mut seg_sy = 0.0f32;
+        let mut seg_n = 0u32;
+        let mut prev_right = -1.0f32;
+        for w in words {
+            if prev_right >= 0.0 && (w.x_left - prev_right) > WORD_GAP && !seg_texts.is_empty() {
+                let sub = seg_texts.join(" ");
+                full.push_str(&sub);
+                full.push('\n');
+                lines_out.push((sub, seg_sx / seg_n as f32, seg_sy / seg_n as f32));
+                seg_texts.clear();
+                seg_sx = 0.0;
+                seg_sy = 0.0;
+                seg_n = 0;
+            }
+            seg_texts.push(&w.text);
+            seg_sx += (w.x_left + w.x_right) / 2.0;
+            seg_sy += w.cy;
+            seg_n += 1;
+            prev_right = w.x_right;
+        }
+        if !seg_texts.is_empty() {
+            let sub = seg_texts.join(" ");
+            full.push_str(&sub);
+            full.push('\n');
+            lines_out.push((sub, seg_sx / seg_n as f32, seg_sy / seg_n as f32));
+        }
+    }
+
+    (full, lines_out)
+}
+
+
 /// Tesseract stand-in for `Windows.Media.Ocr`. Same contract: a BGRA buffer in,
 /// `(full_text, per-line (text, x_centre, y_centre))` out.
 ///
@@ -2482,14 +2609,21 @@ pub fn capture_desktop_for_diag() -> Option<(Vec<u8>, u32, u32)> {
     None
 }
 
+// Upstream's own non-Windows stubs, narrowed to exclude Linux now that Linux has
+// real implementations. Kept in upstream's wording and shape so the only delta
+// on these lines is the widened `cfg`.
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-pub fn run_ocr(
-    _pixels_bgra: &[u8],
-    _w: u32,
-    _h: u32,
-    _layout: OcrLayout,
-) -> Result<(String, Vec<(String, f32, f32)>), String> {
+pub fn run_windows_ocr(_bmp: Vec<u8>, _w: u32, _h: u32) -> Result<(String, Vec<(String, f32, f32)>), String> {
     Err(OCR_UNSUPPORTED.into())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub fn extract_reward_items_twophase(
+    _pixels: &[u8], _w: u32, _cap_h: u32, _full_h: u32,
+    _catalog: &[(String, String)], _capture_info: &str,
+    _hint_squad_size: Option<usize>, _player_names: &[String],
+) -> (bool, bool, Vec<String>, Vec<f32>, String) {
+    (false, false, vec![], vec![], String::new())
 }
 
 #[cfg(test)]

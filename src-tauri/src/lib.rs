@@ -2503,9 +2503,9 @@ async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
             let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
             let px = ocr::capture_warframe_pixels().map_err(|e| format!("Capture: {}", e))?;
             let (pixels, w, h) = px;
-            let full_text = ocr::ocr_pixels_rect(&pixels, w, h, 0.0, 1.0, 0.0, 0.82, ocr::OcrLayout::Scattered)
+            let full_text = ocr::ocr_pixels_rect(&pixels, w, h, 0.0, 1.0, 0.0, 0.82)
                 .unwrap_or_default();
-            let card_text = ocr::ocr_pixels_rect(&pixels, w, h, 0.20, 0.65, 0.28, 0.82, ocr::OcrLayout::Block)
+            let card_text = ocr::ocr_pixels_rect(&pixels, w, h, 0.20, 0.65, 0.28, 0.82)
                 .unwrap_or_default();
             // "FITS IN" is a two-word label in the far right panel. Over a whole
             // 4K frame it is small enough to be missed, so it gets the same
@@ -2518,7 +2518,7 @@ async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
             // names the actual weapon ("Kuva Nukor") while the mod name above the
             // card gives only the base weapon ("Nukor Crita-hexapha"), and the two
             // carry different riven dispositions.
-            let panel_text = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.73, 1.0, 0.30, 0.95, ocr::OcrLayout::Block)
+            let panel_text = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.73, 1.0, 0.30, 0.95)
                 .unwrap_or_default();
             let _ = append_to_file(&riven_log2, &format!(
                 "[STEP 2] OCR attempt {} — {}\n├─ Full text:\n{}\n├─ Panel text:\n{}\n└─ Card text:\n{}\n\n",
@@ -2588,8 +2588,8 @@ async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
             match ocr::capture_warframe_pixels() {
                 Ok((px, w, h)) => {
                     // Wider y range to catch element-icon stat lines near card bottom
-                    let left  = ocr::ocr_pixels_rect(&px, w, h, 0.18, 0.44, 0.25, 0.84, ocr::OcrLayout::Block).unwrap_or_default();
-                    let right = ocr::ocr_pixels_rect(&px, w, h, 0.44, 0.68, 0.25, 0.84, ocr::OcrLayout::Block).unwrap_or_default();
+                    let left  = ocr::ocr_pixels_rect(&px, w, h, 0.18, 0.44, 0.25, 0.84).unwrap_or_default();
+                    let right = ocr::ocr_pixels_rect(&px, w, h, 0.44, 0.68, 0.25, 0.84).unwrap_or_default();
                     let _ = append_to_file(&riven_log3, &format!(
                         "[STEP 2] Original (left):\n{}\n\nNew roll (right):\n{}\n\n", left, right
                     ));
@@ -3083,7 +3083,7 @@ fn riven_screen_status() -> String {
         return "unknown".into();
     };
 
-    let header = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.0, 0.55, 0.0, 0.10, ocr::OcrLayout::Block)
+    let header = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.0, 0.55, 0.0, 0.10)
         .unwrap_or_default();
     let in_inventory = header.to_lowercase().contains("inventory");
 
@@ -3092,7 +3092,7 @@ fn riven_screen_status() -> String {
         return "unknown".into();
     }
 
-    let right = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.73, 1.0, 0.30, 0.80, ocr::OcrLayout::Block)
+    let right = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.73, 1.0, 0.30, 0.80)
         .unwrap_or_default();
     let rl = right.to_lowercase();
     // In comparison mode "FITS IN" may be partially cut off, reading as "SIN", "IN", "TS IN" etc.
@@ -3126,7 +3126,7 @@ fn riven_screen_visible() -> bool {
 
     // Check header (x 0–55%, y 0–10%) for "INVENTORY" — confirms Warframe is focused
     // and we're in the mods screen. If header is absent, user alt-tabbed; keep overlay.
-    let header = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.0, 0.55, 0.0, 0.10, ocr::OcrLayout::Block)
+    let header = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.0, 0.55, 0.0, 0.10)
         .unwrap_or_default();
     let in_inventory = header.to_lowercase().contains("inventory");
 
@@ -3138,7 +3138,7 @@ fn riven_screen_visible() -> bool {
     }
 
     // Check right panel (x 73–100%, y 30–80%) for "FITS IN"
-    let right = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.73, 1.0, 0.30, 0.80, ocr::OcrLayout::Block)
+    let right = ocr::ocr_pixels_rect_raw(&pixels, w, h, 0.73, 1.0, 0.30, 0.80)
         .unwrap_or_default();
     let fits_in_visible = right.to_lowercase().contains("fits");
     let right_preview = right.lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join(" | ");
