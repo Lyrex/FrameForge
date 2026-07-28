@@ -7,6 +7,23 @@ body:
       value: |
         Have an idea to make FrameForge better? Fill out the fields below so we can understand the request clearly.
 
+  - type: dropdown
+    id: feature_area
+    attributes:
+      label: Feature Area
+      description: Which part of the app does this relate to?
+      options:
+        - Inventory / Memory Scanner
+        - Relic Overlay (OCR)
+        - Market Helper
+        - Relic Helper
+        - Foundry / Crafting
+        - Trading (WFM)
+        - Settings / UI
+        - Other / New feature
+    validations:
+      required: true
+
   - type: textarea
     id: idea
     attributes:

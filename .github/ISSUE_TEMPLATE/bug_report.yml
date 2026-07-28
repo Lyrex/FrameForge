@@ -12,7 +12,7 @@ body:
     attributes:
       label: App Version
       description: Open the Settings tab and scroll to the bottom.
-      placeholder: e.g. 1.8.0
+      placeholder: e.g. 2.7.0
     validations:
       required: true
 
@@ -32,6 +32,32 @@ body:
       options:
         - Windows 11
         - Windows 10
+    validations:
+      required: true
+
+  - type: dropdown
+    id: display_mode
+    attributes:
+      label: Warframe Display Mode
+      description: Only relevant for OCR / overlay bugs. Skip if unsure.
+      options:
+        - Not applicable
+        - Windowed
+        - Borderless Windowed
+        - Fullscreen Exclusive
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: How badly does this affect you?
+      options:
+        - "Crash / data loss"
+        - "Major — core feature broken"
+        - "Minor — feature works but behaves incorrectly"
+        - "Visual — cosmetic / display issue only"
     validations:
       required: true
 
