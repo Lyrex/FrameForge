@@ -7440,6 +7440,12 @@ fn show_overlay_window(
     ));
     let _ = win.show();
     let _ = win.set_always_on_top(true);
+    // The move above is only honoured on a later turn of the GTK main loop, and
+    // the window manager owns the window's position until then. Ask X directly
+    // so the band is on the game's monitor for its first frame rather than a
+    // second later.
+    #[cfg(target_os = "linux")]
+    overlay_linux::place(&win, x, y, w, h);
 
     // On Windows 10, WebView2 defers loading the page when the window starts
     // off-screen. If it's still on about:blank, navigate to the overlay URL now.

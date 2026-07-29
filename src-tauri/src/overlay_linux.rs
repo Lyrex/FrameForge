@@ -166,6 +166,42 @@ fn apply_hints(xid: u32, window_type: &'static str) -> Result<(), String> {
     Ok(())
 }
 
+/// Put an overlay window where the caller asked, through X rather than through
+/// GTK.
+///
+/// Tauri's `set_position` on a window that is not yet mapped is a request the
+/// window manager answers with its own placement, and the client's value is only
+/// applied on a later turn of the GTK main loop. The overlay is shown at the
+/// moment the app is busiest, with OCR running on the reward screen, so that
+/// turn can be a long time coming, and until it arrives the band sits wherever
+/// KWin put it. On a two-monitor desktop that is routinely the wrong monitor.
+///
+/// A `ConfigureWindow` on our own connection does not queue behind any of that.
+///
+/// The size rides along because `set_size` defers the same way, and the band is
+/// a strip as wide as the game's monitor, so a late size is as visible as a late
+/// position.
+pub(crate) fn place(window: &WebviewWindow, x: i32, y: i32, width: u32, height: u32) {
+    let Some(xid) = xid(window) else { return };
+    if let Err(e) = configure(xid, x, y, width, height) {
+        eprintln!("[overlay] {}: {e}", window.label());
+    }
+}
+
+fn configure(xid: u32, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
+    let conn = x11_connect()?;
+    conn.send_and_check_request(&x::ConfigureWindow {
+        window: x::Window::new(xid),
+        value_list: &[
+            x::ConfigWindow::X(x),
+            x::ConfigWindow::Y(y),
+            x::ConfigWindow::Width(width),
+            x::ConfigWindow::Height(height),
+        ],
+    })
+    .map_err(|e| format!("Cannot place the overlay window: {e}"))
+}
+
 /// The window's X11 id. `None` means the window is not an X11 window at all,
 /// which under `GDK_BACKEND=x11` means it has never been realised.
 fn xid(window: &WebviewWindow) -> Option<u32> {
