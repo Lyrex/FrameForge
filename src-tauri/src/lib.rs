@@ -23,6 +23,10 @@ mod db;
 mod log_parser;
 mod memory_scanner;
 mod ocr;
+// Overlay placement is X11 work with no Windows counterpart — the Windows
+// overlay needs nothing beyond the window options Tauri already sets.
+#[cfg(target_os = "linux")]
+mod overlay_linux;
 mod wfcd;
 
 use db::{QuantityChange, SnapshotPoint, Trade, TrackedItem};
@@ -8618,6 +8622,37 @@ pub fn run() {
                 // monitors, and KWin clamps one to y=0 outright — either way the
                 // window has to be put away again right after show().
                 park_overlay_offscreen(app.handle(), "relic-overlay");
+                #[cfg(target_os = "linux")]
+                {
+                    // The band reports on the rewards and is never clicked, so
+                    // the pointer belongs to the game underneath it.
+                    let _ = win.set_ignore_cursor_events(true);
+                    overlay_linux::hint_before_map(&win, overlay_linux::AfterHinting::LeaveHidden);
+                }
+            }
+
+            // The riven panel is created from the frontend on demand and is on
+            // screen the moment it exists, so its hints are written from here
+            // rather than at a call site that would have to know about X11.
+            #[cfg(target_os = "linux")]
+            {
+                use tauri::Listener;
+                let handle = app.handle().clone();
+                app.listen("tauri://window-created", move |event| {
+                    #[derive(serde::Deserialize)]
+                    struct Created {
+                        label: String,
+                    }
+                    let Ok(created) = serde_json::from_str::<Created>(event.payload()) else {
+                        return;
+                    };
+                    if created.label != "riven-overlay" {
+                        return;
+                    }
+                    if let Some(win) = handle.get_webview_window(&created.label) {
+                        overlay_linux::hint_before_map(&win, overlay_linux::AfterHinting::ShowAgain);
+                    }
+                });
             }
 
             // Load relics.run prices in the background. On a cache hit (today's file exists)

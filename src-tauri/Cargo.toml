@@ -61,5 +61,6 @@ windows = { version = "0.58", features = [
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+raw-window-handle = "0.6"
 tesseract = "0.15.2"
 xcb = "1.7"

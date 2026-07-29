@@ -5023,6 +5023,7 @@ dependencies = [
  "dirs 5.0.1",
  "lzma-rs",
  "native-tls",
+ "raw-window-handle",
  "regex",
  "rusqlite",
  "serde",

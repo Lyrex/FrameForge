@@ -2003,7 +2003,7 @@ const WARFRAME_WINDOW_TITLE: &str = "Warframe";
 /// connection would have to be re-established anyway whenever the X server or
 /// XWayland restarts.
 #[cfg(target_os = "linux")]
-fn x11_connect() -> Result<xcb::Connection, String> {
+pub(crate) fn x11_connect() -> Result<xcb::Connection, String> {
     xcb::Connection::connect(None)
         .map(|(conn, _screen)| conn)
         .map_err(|e| format!("Cannot connect to the X server: {e}"))
