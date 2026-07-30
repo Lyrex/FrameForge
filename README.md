@@ -12,7 +12,7 @@ A desktop companion for Warframe — live inventory, market prices, trading, tim
 
 This is the Linux fork of [WyrmStudios/FrameForge](https://github.com/WyrmStudios/FrameForge). It exists because the Linux port was declined upstream, not because of a disagreement: upstream is the project, this is its platform branch, and fixes that are not Linux-specific are still sent upstream as individual pull requests. The app, its name and its bundle identifier are unchanged from upstream, so the version string is what separates the two: `2.8.0+linux.1` is upstream's 2.8.0 plus this fork's Linux work, and `+linux.<n>` counts the Linux-only releases cut on that base.
 
-Releases here are Linux only: `.deb`, `.rpm` and `.AppImage`. **Windows users want [upstream's releases](https://github.com/WyrmStudios/FrameForge/releases)**, not this repository. The port reworks code the Windows paths also run — `7689b61` (log watcher), `f5ed489` (riven flag read) and `6ed6dc8` (inventory blob seed) — and none of it has been exercised on Windows, so building this fork for Windows is not the same as building upstream.
+Releases here are Linux only: `.deb`, `.rpm` and `.AppImage`. **Windows users want [upstream's releases](https://github.com/WyrmStudios/FrameForge/releases)**, not this repository.
 
 The overlay stack, the `EE.log` discovery and several cross-platform fixes started from [xamionex/FrameForge-Linux](https://github.com/xamionex/FrameForge-Linux). That material was reworked here rather than taken as-is, so defects in it are ours and belong in this repository's issues, not theirs.
 
@@ -150,8 +150,8 @@ branch no release covers.
 ```sh
 # Prerequisites: Node.js 20+, pnpm, a Rust toolchain, and the system
 # development headers listed in .github/actions/linux-build-deps/action.yml
-git clone https://github.com/Lyrex/FrameForge.git
-cd FrameForge
+git clone https://github.com/Lyrex/FrameForge-Linux.git
+cd FrameForge-Linux
 pnpm install
 ```
 
