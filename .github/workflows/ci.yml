@@ -68,14 +68,19 @@ jobs:
 
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # tag=v6.0.9
         with:
-          version: 10
+          version: 11
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # tag=v7.0.0
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
 
-      - run: pnpm install --frozen-lockfile
+      # esbuild is the only dependency that asks to run an install script, and
+      # its platform binary comes through optionalDependencies, so skipping
+      # loses nothing. Approving it instead would mean tracking
+      # pnpm-workspace.yaml: pnpm 11 reads build approvals from nowhere else,
+      # and that is one more file in the delta.
+      - run: pnpm install --frozen-lockfile --ignore-scripts
 
       - run: pnpm build
 
