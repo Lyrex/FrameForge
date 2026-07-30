@@ -535,6 +535,45 @@ fn find_blob_end(raw: &[u8]) -> Option<usize> {
     Some(after + brace + 1)
 }
 
+const START_MARKER: &[u8] = b"\"SubscribedToEmails\"";
+const ALT_STARTS: &[&[u8]] = &[
+    b"\"MiscItems\":[{\"ItemType\":\"/Lotus/",
+    b"\"Suits\":[{\"ItemType\":\"/Lotus/",
+    b"\"RegularCredits\":",
+];
+
+/// Walk backward from `marker_off` counting braces; return the offset of the
+/// outermost `{` that encloses the marker.  Returns `None` when the buffer is
+/// inconsistent (freed/partial blob where the opening brace was overwritten).
+fn enclosing_object_start(buf: &[u8], marker_off: usize) -> Option<usize> {
+    let mut depth: i32 = 0;
+    for i in (0..marker_off).rev() {
+        match buf[i] {
+            b'}' => depth += 1,
+            b'{' => {
+                depth -= 1;
+                if depth < 0 { return Some(i); }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Locate seed offsets for the FULL_ACCOUNT blob within `buf`.
+/// Returns `(marker_off, json_open)`:
+///   - `marker_off`: byte position of the first known start marker
+///   - `json_open`:  byte position of the outermost `{` enclosing the marker
+fn blob_seed_offsets(buf: &[u8]) -> (usize, usize) {
+    let marker_off = buf.windows(START_MARKER.len())
+        .position(|w| w == START_MARKER)
+        .or_else(|| ALT_STARTS.iter().find_map(|a|
+            buf.windows(a.len()).position(|w| w == *a)))
+        .unwrap_or(buf.len().saturating_sub(1));
+    let json_open = enclosing_object_start(buf, marker_off).unwrap_or(marker_off);
+    (marker_off, json_open)
+}
+
 /// Parse a FULL_ACCOUNT blob from raw memory bytes into structured inventory data.
 ///
 /// Compute the deterministic riven mod name from its buff stats.
@@ -620,7 +659,11 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
     };
 
     let json: serde_json::Value = serde_json::from_slice(&json_bytes)
-        .map_err(|e| eprintln!("[blob-parse] JSON error: {}", e))
+        .map_err(|e| {
+            let head: String = json_bytes[..json_bytes.len().min(48)]
+                .iter().map(|&b| if b >= 0x20 && b < 0x7f { b as char } else { '.' }).collect();
+            eprintln!("[blob-parse] JSON error: {} | head: {:?}", e, head);
+        })
         .ok()?;
 
     // Scalars
@@ -916,7 +959,6 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
     const PAGE_EXECUTE_WC:   u32 = 0x80;
     const EXEC_MASK: u32 = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_RW | PAGE_EXECUTE_WC;
 
-    const START_MARKER:  &[u8] = b"\"SubscribedToEmails\"";
     const MISSION_DELTA: &[u8] = b"\"InventoryChanges\":";
     const LOTUS_KEY:     &[u8] = b"/Lotus/";
     const ANCHORS: &[&[u8]] = &[
@@ -926,14 +968,6 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
         b"\"LongGuns\":[",
         b"\"Melee\":[",
         b"\"Pistols\":[",
-    ];
-    // Secondary start triggers: unambiguous inventory fields that are present in every
-    // account's FULL_ACCOUNT blob even when SubscribedToEmails is absent or in a
-    // skipped memory region. Combined with !is_mission these are safe to use alone.
-    const ALT_STARTS: &[&[u8]] = &[
-        b"\"MiscItems\":[{\"ItemType\":\"/Lotus/",  // resources array with real items
-        b"\"Suits\":[{\"ItemType\":\"/Lotus/",       // warframes array with real items
-        b"\"RegularCredits\":",                       // credit balance — in every blob
     ];
 
     // ── Fast path: try the cached region from last successful scan ─────────────
@@ -1179,17 +1213,7 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
             }
             combined.extend_from_slice(chunk);
 
-            // Find any known start marker within combined, then search backward for
-            // the first {"  — that is the outermost JSON object open.
-            let start_off = combined.windows(START_MARKER.len())
-                .position(|w| w == START_MARKER)
-                .or_else(|| ALT_STARTS.iter().find_map(|a|
-                    combined.windows(a.len()).position(|w| w == *a)))
-                .unwrap_or(combined.len().saturating_sub(1));
-            let json_open = combined[..start_off + 1]
-                .windows(2)
-                .position(|w| w == b"{\"")
-                .unwrap_or(start_off);
+            let (start_off, json_open) = blob_seed_offsets(&combined);
 
             // Absolute memory address of the seed start (for LAST_BLOB_REGION cache).
             let seed_addr = blob_start_addr + json_open;
@@ -1481,3 +1505,55 @@ fn find_warframe_pid() -> Option<u32> {
     }
 }
 
+#[cfg(test)]
+mod seed_tests {
+    use super::{enclosing_object_start, blob_seed_offsets};
+
+    #[test]
+    fn enclosing_finds_outer_brace() {
+        let buf = b"{\"SubscribedToEmails\":1}";
+        let off = buf.windows(b"SubscribedToEmails".len())
+            .position(|w| w == b"SubscribedToEmails").unwrap();
+        assert_eq!(enclosing_object_start(buf, off), Some(0));
+    }
+
+    #[test]
+    fn enclosing_skips_nested_braces() {
+        let buf = b"{\"nested\":{\"a\":1},\"SubscribedToEmails\":1}";
+        let off = buf.windows(b"SubscribedToEmails".len())
+            .position(|w| w == b"SubscribedToEmails").unwrap();
+        assert_eq!(enclosing_object_start(buf, off), Some(0));
+    }
+
+    #[test]
+    fn enclosing_returns_none_when_no_open_brace() {
+        // Stale/freed blob — the outer { was overwritten
+        let buf = b"x\"SubscribedToEmails\":1}";
+        assert_eq!(enclosing_object_start(buf, 0), None);
+    }
+
+    #[test]
+    fn seed_offsets_with_start_marker() {
+        let buf = b"{\"SubscribedToEmails\":1,\"RegularCredits\":100}";
+        let (marker_off, json_open) = blob_seed_offsets(buf);
+        assert_eq!(json_open, 0);
+        assert!(marker_off > 0);
+    }
+
+    #[test]
+    fn seed_offsets_with_alt_start_regular_credits() {
+        // No SubscribedToEmails — falls through to RegularCredits alt-start
+        let buf = b"{\"RegularCredits\":999}";
+        let (marker_off, json_open) = blob_seed_offsets(buf);
+        assert_eq!(json_open, 0);
+        assert_eq!(marker_off, 1);
+    }
+
+    #[test]
+    fn seed_offsets_stale_blob_falls_back_to_marker() {
+        // The outer { was overwritten — json_open falls back to marker_off
+        let buf = b"x\"SubscribedToEmails\":1}";
+        let (marker_off, json_open) = blob_seed_offsets(buf);
+        assert_eq!(json_open, marker_off);
+    }
+}

@@ -7,9 +7,11 @@ interface Props {
   onTabChange: (t: "trade" | "item") => void;
   dateRange: number | "all";
   onDateRangeChange: (r: number | "all") => void;
+  clockFormat: "auto" | "12h" | "24h";
+  systemLocale: string;
 }
 
-export default function Statistics({ tab, onTabChange, dateRange, onDateRangeChange }: Props) {
+export default function Statistics({ tab, onTabChange, dateRange, onDateRangeChange, clockFormat, systemLocale }: Props) {
   return (
     <div className="statistics">
       <div className="stat-sub-tabs">
@@ -20,7 +22,7 @@ export default function Statistics({ tab, onTabChange, dateRange, onDateRangeCha
           Item Report
         </button>
       </div>
-      {tab === "trade" ? <Reports dateRange={dateRange} onDateRangeChange={onDateRangeChange} /> : <ItemReport />}
+      {tab === "trade" ? <Reports dateRange={dateRange} onDateRangeChange={onDateRangeChange} clockFormat={clockFormat} systemLocale={systemLocale} /> : <ItemReport />}
     </div>
   );
 }

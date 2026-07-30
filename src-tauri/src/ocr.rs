@@ -717,7 +717,20 @@ fn word_found_in_set(
         if ocr_words.iter().any(|w| w.find(suffix).map_or(false, |p| p != 1)) { return true; }
     }
 
-    let max_dist = if catalog_word.len() >= 8 { 2 } else { 1 };
+    // Edit budget by word length. 4 chars is the shortest word this fuzzy-matches
+    // at all; below that the guard above has already returned. One edit in a 4-char
+    // word is a quarter of it, enough to land on a different real catalog word
+    // instead of a damaged read of this one: "limb" reaches "limbo", "gara" reaches
+    // "galatine", "khra" reaches "khora", "star" reaches "stars". Those short words
+    // are usually the only part of a reward name that identifies it, so a wrong hit
+    // scores a full catalog entry for an item that was never on screen.
+    let max_dist = if catalog_word.len() >= 8 {
+        2
+    } else if catalog_word.len() >= 5 {
+        1
+    } else {
+        0
+    };
     let wb = catalog_word.as_bytes();
     for ocr_w in ocr_words {
         // Full-word Levenshtein — reject pure prefix/suffix insertions (len_diff == dist && >= 2)
@@ -1183,6 +1196,19 @@ fn bar_centers_are_valid(centers: &[f32]) -> bool {
     // OCR text and another column absorbing text from two cards at once.
     for pair in centers.windows(2) {
         if pair[1] - pair[0] < 0.08 { return false; }
+    }
+    // Cards sit on a fixed pitch, so the gaps between real bars are equal to within
+    // a pixel or two. The span check below only looks at the outermost pair, so a
+    // lopsided set gets through whenever its two ends happen to land the right
+    // distance apart. [0.204, 0.316, 0.655] spans 0.451 against the 0.46 expected
+    // of three cards, but its gaps differ threefold. The columns built from it put
+    // two cards' text into a single column and cross their component names.
+    if n >= 3 {
+        let gaps: Vec<f32> = centers.windows(2).map(|p| p[1] - p[0]).collect();
+        let mean = gaps.iter().sum::<f32>() / gaps.len() as f32;
+        // A third of the ~0.13 card pitch. Wide enough for the jitter of locating
+        // the small rarity arrows, and well under a card's width.
+        if gaps.iter().any(|g| (g - mean).abs() > 0.04) { return false; }
     }
     let span = centers[n - 1] - centers[0];
     // Expected spans per card count (measured from real captures)
@@ -1865,4 +1891,42 @@ pub fn extract_reward_items_twophase(
     _hint_squad_size: Option<usize>, _player_names: &[String],
 ) -> (bool, bool, Vec<String>, Vec<f32>, String) {
     (false, false, vec![], vec![], String::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ocr_words(words: &[&str]) -> std::collections::HashSet<String> {
+        words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn four_character_words_must_be_read_exactly() {
+        for (catalog_word, on_screen) in [
+            ("limb", "limbo"),
+            ("gara", "galatine"),
+            ("khra", "khora"),
+            ("star", "stars"),
+        ] {
+            assert!(
+                !word_found_in_set(catalog_word, &ocr_words(&[on_screen])),
+                "{catalog_word:?} must not match {on_screen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn longer_words_keep_their_edit_tolerance() {
+        assert!(word_found_in_set("blueprint", &ocr_words(&["bluepnnt"])));
+        assert!(word_found_in_set("tenora", &ocr_words(&["tenova"])));
+        assert!(word_found_in_set("limb", &ocr_words(&["lim"])));
+    }
+
+    #[test]
+    fn bar_centers_must_be_evenly_spaced() {
+        assert!(!bar_centers_are_valid(&[0.204, 0.316, 0.655]));
+        assert!(bar_centers_are_valid(&[0.27, 0.50, 0.73]));
+        assert!(bar_centers_are_valid(&[0.24, 0.41, 0.59, 0.76]));
+    }
 }

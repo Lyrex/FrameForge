@@ -225,8 +225,11 @@ function fmtBytes(n: number) {
 }
 function deltaClass(d: number) { return d > 0 ? "delta-pos" : "delta-neg"; }
 function deltaText(d: number) { return d > 0 ? `+${fmt(d)}` : fmt(d); }
-function timeStr(ts: number) {
-  return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+function timeStr(ts: number, format: "auto" | "12h" | "24h" = "auto", locale = "en-US") {
+  const opts: Intl.DateTimeFormatOptions = { hour: "2-digit", minute: "2-digit" };
+  if (format === "12h") opts.hour12 = true;
+  else if (format === "24h") opts.hour12 = false;
+  return new Date(ts * 1000).toLocaleTimeString(locale, opts);
 }
 
 // ─── Standalone modular window page (runs in pop-out Tauri window) ────────────
@@ -647,6 +650,8 @@ const [blobLogEnabled, setBlobLogEnabled] = useState(false);
   const [colorblindMode, setColorblindMode] = useState(() =>
     localStorage.getItem("ff-colorblind") === "true"
   );
+  const [clockFormat, setClockFormat] = useState<"auto" | "12h" | "24h">("auto");
+  const [systemLocale, setSystemLocale] = useState("en-US");
   const [itemsRefreshKey, setItemsRefreshKey] = useState(0);
   const [imgCacheDir, setImgCacheDir] = useState("");
 
@@ -670,12 +675,12 @@ const [blobLogEnabled, setBlobLogEnabled] = useState(false);
   // Refs so we can read the latest state in the save callback without stale closures
   const settingsLoadedRef = useRef(false);
   const settingsRef = useRef({
-    overlayEnabled: true, overlayPriority: "completion", textScale: 1, colorblindMode: false, companionApiEnabled: false, memoryScannerEnabled: false, blobLogEnabled: false, apiLogEnabled: false, autoDiagEnabled: false,
+    overlayEnabled: true, overlayPriority: "completion", textScale: 1, colorblindMode: false, clockFormat: "auto" as "auto" | "12h" | "24h", companionApiEnabled: false, memoryScannerEnabled: false, blobLogEnabled: false, apiLogEnabled: false, autoDiagEnabled: false,
     tracked: [] as string[], favorites: [] as string[], timerFavorites: [] as string[], fissureWatches: [] as FissureWatch[], modularWidth: 240,
     modularSectionOrder: ["tracking", "favorites", "timers"] as string[], modularPopout: false,
     wfmInvisibleOnStart: false, wfmInvisibleOnClose: false, wfmAutoInvisible: false, wfmAutoInvisibleMins: 30,
   });
-  settingsRef.current = { overlayEnabled, overlayPriority, textScale, colorblindMode, companionApiEnabled, memoryScannerEnabled, blobLogEnabled, apiLogEnabled, autoDiagEnabled, tracked, favorites, timerFavorites, fissureWatches, modularWidth, modularSectionOrder, modularPopout, wfmInvisibleOnStart, wfmInvisibleOnClose, wfmAutoInvisible, wfmAutoInvisibleMins };
+  settingsRef.current = { overlayEnabled, overlayPriority, textScale, colorblindMode, clockFormat, companionApiEnabled, memoryScannerEnabled, blobLogEnabled, apiLogEnabled, autoDiagEnabled, tracked, favorites, timerFavorites, fissureWatches, modularWidth, modularSectionOrder, modularPopout, wfmInvisibleOnStart, wfmInvisibleOnClose, wfmAutoInvisible, wfmAutoInvisibleMins };
 
   const saveAllSettings = useCallback(() => {
     invoke("save_settings", { json: JSON.stringify(settingsRef.current) }).catch((e) => {
@@ -816,6 +821,9 @@ if (typeof s.autoDiagEnabled === "boolean") {
           setColorblindMode(s.colorblindMode);
           localStorage.setItem("ff-colorblind", String(s.colorblindMode));
         }
+        if (typeof s.clockFormat === "string" && ["auto", "12h", "24h"].includes(s.clockFormat)) {
+          setClockFormat(s.clockFormat as "auto" | "12h" | "24h");
+        }
         if (Array.isArray(s.tracked)) setTracked(s.tracked);
         if (Array.isArray(s.favorites)) setFavorites(s.favorites);
         if (Array.isArray(s.timerFavorites)) setTimerFavorites(s.timerFavorites);
@@ -840,6 +848,7 @@ if (typeof s.autoDiagEnabled === "boolean") {
       } catch {}
     }).catch(() => {});
 
+    invoke<string>("get_system_locale").then(loc => { if (loc) setSystemLocale(loc); }).catch(() => {});
     invoke<CatalogItem[]>("get_all_items").then(items => { setCatalog(items); catalogRef.current = items; });
     invoke<Record<string, number>>("get_current_quantities").then(setQuantities);
     invoke<number>("get_diag_folder_size").then(setDiagFolderSize).catch(() => {});
@@ -1814,7 +1823,7 @@ if (typeof s.autoDiagEnabled === "boolean") {
               : "offline";
             const wfApiDetail =
               !companionApiEnabled                    ? "OFF"
-              : wfConnected && lastApiRefresh         ? timeStr(lastApiRefresh)
+              : wfConnected && lastApiRefresh         ? timeStr(lastApiRefresh, clockFormat, systemLocale)
               : wfConnected                           ? "Connected"
               : warframeRunning                       ? "Connecting…"
               : "Waiting";
@@ -2203,6 +2212,24 @@ if (typeof s.autoDiagEnabled === "boolean") {
                           settingsRef.current = { ...settingsRef.current, textScale: v };
                           saveAllSettings();
                         }} />
+                    </div>
+                    <div className="settings-row" style={{ marginTop: 8 }}>
+                      <div className="settings-row-info">
+                        <span className="settings-row-label">Clock Format</span>
+                        <span className="settings-row-desc">How times are displayed throughout the app.{clockFormat === "auto" ? ` System locale: ${systemLocale}` : ""}</span>
+                      </div>
+                      <div style={{ display: "flex", gap: 4 }}>
+                        {(["auto", "12h", "24h"] as const).map(f => (
+                          <button key={f} className="btn-secondary" style={{ minWidth: 44, background: clockFormat === f ? "rgba(56,139,253,.15)" : undefined, borderColor: clockFormat === f ? "var(--accent)" : undefined }}
+                            onClick={() => {
+                              setClockFormat(f);
+                              settingsRef.current = { ...settingsRef.current, clockFormat: f };
+                              saveAllSettings();
+                            }}>
+                            {f === "auto" ? "Auto" : f}
+                          </button>
+                        ))}
+                      </div>
                     </div>
                   </div>
                 </>}
@@ -2643,7 +2670,7 @@ if (typeof s.autoDiagEnabled === "boolean") {
                           </span>
                           <span className={`log-delta ${deltaClass(c.delta)}`}>{deltaText(c.delta)}</span>
                           <span className="log-range">{fmt(c.old_qty)} → {fmt(c.new_qty)}</span>
-                          <span className="log-time">{timeStr(c.timestamp)}</span>
+                          <span className="log-time">{timeStr(c.timestamp, clockFormat, systemLocale)}</span>
                         </div>
                       );
                     })
@@ -2701,7 +2728,7 @@ if (typeof s.autoDiagEnabled === "boolean") {
         {/* ── Statistics module ── */}
         {activeModule === "statistics" && (
           <ErrorBoundary>
-            <Statistics tab={statsTab} onTabChange={setStatsTab} dateRange={reportsDateRange} onDateRangeChange={setReportsDateRange} />
+            <Statistics tab={statsTab} onTabChange={setStatsTab} dateRange={reportsDateRange} onDateRangeChange={setReportsDateRange} clockFormat={clockFormat} systemLocale={systemLocale} />
           </ErrorBoundary>
         )}
 

@@ -480,7 +480,7 @@ const CraftCard = memo(function CraftCard({ item, recipe, inventory, relicDrops,
 
 const CRAFT_CATEGORIES = [
   "Warframes", "Primary", "Secondary", "Melee",
-  "Companions", "Archwing", "Blueprints", "Misc",
+  "Companions", "Archwing", "Parts", "Blueprints", "Misc",
 ];
 
 export default function Foundry({ inventory, refreshKey, crafting, subsummedWarframes = new Set(), tracked, onTrackToggle, filters, onFiltersChange }: Props) {

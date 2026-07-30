@@ -455,7 +455,7 @@ export default function TimerHelper({ favorites, onFavoriteToggle, fissureWatche
                 <div className="news-tile-msg">{item.message}</div>
                 <div className="news-tile-meta">
                   <span className="news-tile-date">
-                    {new Date(item.date).toLocaleDateString("en-US", { month: "short", day: "numeric" })}
+                    {new Date(item.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
                   </span>
                   <div className="news-tile-tags">
                     {item.primeAccess && <span className="news-tag news-tag-prime">Prime</span>}

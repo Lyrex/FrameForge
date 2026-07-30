@@ -131,10 +131,13 @@ const BADGE_CLASS: Record<string, string> = {
   sale: "rpt-badge-sale", purchase: "rpt-badge-purchase", trade: "rpt-badge-trade",
 };
 
-function TradeCard({ session }: { session: TradeSession }) {
+function TradeCard({ session, clockFormat, systemLocale }: { session: TradeSession; clockFormat: "auto" | "12h" | "24h"; systemLocale: string }) {
   const date = new Date(session.timestamp);
-  const dateStr = date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
-  const timeStr = date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  const dateStr = date.toLocaleDateString(systemLocale, { month: "short", day: "numeric", year: "numeric" });
+  const timeOpts: Intl.DateTimeFormatOptions = { hour: "2-digit", minute: "2-digit" };
+  if (clockFormat === "12h") timeOpts.hour12 = true;
+  else if (clockFormat === "24h") timeOpts.hour12 = false;
+  const timeStr = date.toLocaleTimeString(systemLocale, timeOpts);
 
   return (
     <div className="rpt-session-card">
@@ -277,9 +280,11 @@ function ItemImg({ imageName, size = 28 }: { imageName?: string; size?: number }
 interface Props {
   dateRange: number | "all";
   onDateRangeChange: (r: number | "all") => void;
+  clockFormat: "auto" | "12h" | "24h";
+  systemLocale: string;
 }
 
-export default function Reports({ dateRange, onDateRangeChange }: Props) {
+export default function Reports({ dateRange, onDateRangeChange, clockFormat, systemLocale }: Props) {
   const [trades, setTrades]         = useState<Trade[]>([]);
   const [loading, setLoading]       = useState(true);
   const [topItems, setTopItems]     = useState<WfmTopItem[]>([]);
@@ -467,7 +472,7 @@ export default function Reports({ dateRange, onDateRangeChange }: Props) {
               <div className="rpt-empty">
                 <div className="rpt-empty-title">No trades in this period</div>
               </div>
-            ) : sessions.map(s => <TradeCard key={s.sessionId} session={s} />)}
+            ) : sessions.map(s => <TradeCard key={s.sessionId} session={s} clockFormat={clockFormat} systemLocale={systemLocale} />)}
           </div>
         ) : <>
 
