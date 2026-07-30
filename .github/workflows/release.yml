@@ -6,7 +6,7 @@ on:
       # `<upstream-version>+linux.<n>`, e.g. v2.7.0+linux.1. Semver build
       # metadata, so it sorts equal to upstream's v2.7.0 rather than before it,
       # which is what a `-linux.1` prerelease suffix would have done.
-      - 'v*+linux.*'
+      - 'v*\+linux.*'
 
 permissions:
   contents: write
@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
 
       # First, so a tree whose version disagrees with the tag costs a second
       # rather than a ~10 minute build and an upload.
@@ -25,23 +25,26 @@ jobs:
 
       - uses: ./.github/actions/linux-build-deps
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # tag=v6.0.9
         with:
           version: 10
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # tag=v7.0.0
         with:
           node-version: 22
           cache: pnpm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install rust stable
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # branch=master
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # tag=v2.9.1
         with:
           workspaces: src-tauri
 
       - name: Cache the Tesseract model
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # tag=v6.1.0
         with:
           path: src-tauri/tessdata
           key: tessdata-${{ hashFiles('scripts/fetch-tessdata.sh') }}
@@ -71,7 +74,7 @@ jobs:
       # Windows is unsupported here. None of that is derivable from the tree,
       # which is also why the release is drafted rather than published.
       - name: Draft the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # tag=v3.0.2
         with:
           draft: true
           name: ${{ github.ref_name }}

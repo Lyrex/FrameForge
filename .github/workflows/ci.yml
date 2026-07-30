@@ -7,7 +7,9 @@ name: CI
 on:
   push:
     branches: [main]
+
   pull_request:
+
   workflow_dispatch:
 
 concurrency:
@@ -18,22 +20,24 @@ jobs:
   rust:
     name: Rust build and tests
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
 
       - uses: ./.github/actions/linux-build-deps
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install rust stable
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # branch=master
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # tag=v2.9.1
         with:
           workspaces: src-tauri
 
       # The script pins the model by checksum, so hashing the script identifies
       # the model, and the 23 MB download happens once per model change.
       - name: Cache the Tesseract model
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # tag=v6.1.0
         with:
           path: src-tauri/tessdata
           key: tessdata-${{ hashFiles('scripts/fetch-tessdata.sh') }}
@@ -45,24 +49,28 @@ jobs:
       - name: Stand in for the frontend build
         run: mkdir -p dist
 
-      - name: Build
+      - name: cargo build --locked
         run: cargo build --manifest-path src-tauri/Cargo.toml --locked
 
-      - name: Test
+      - name: cargo test --locked
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+      # https://github.com/rust-lang/cargo/issues/6669
+      - name: cargo test --doc
+        run: cargo test --locked --doc
 
   frontend:
     name: Frontend typecheck and build
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # tag=v6.0.9
         with:
           version: 10
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # tag=v7.0.0
         with:
           node-version: 22
           cache: pnpm
@@ -76,7 +84,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
 
       - run: shellcheck scripts/*.sh
 
@@ -85,6 +93,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
 
       - run: bash scripts/check-version.sh
