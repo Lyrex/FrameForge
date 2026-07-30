@@ -56,6 +56,15 @@ jobs:
       - name: Build bundles
         run: NO_STRIP=true pnpm tauri build --bundles deb,rpm,appimage
 
+      # linuxdeploy leaves the AppImage's root .desktop and .DirIcon as
+      # symlinks that launcher-integration tools cannot read, so the repack
+      # materializes them.
+      - name: Materialize the AppImage root metadata
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends squashfs-tools
+          bash scripts/fix-appimage.sh src-tauri/target/release/bundle/appimage/*.AppImage
+
       # Release notes are written by hand rather than generated from commits.
       # Every release has to state the upstream release it is based on, what was
       # verified and on which distro, session type and compositor, and that
