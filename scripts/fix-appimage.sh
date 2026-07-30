@@ -32,6 +32,16 @@ head -c "$offset" "$appimage" > runtime
 
 "$appimage" --appimage-extract > /dev/null
 
+# EGL comes from the host's Mesa, and Mesa built against wayland >= 1.23
+# calls wl_display_create_queue_with_name. The libwayland-client that
+# linuxdeploy bundles from the build distro predates that symbol, Mesa binds
+# to the bundled copy, and EGL display creation fails with EGL_BAD_PARAMETER:
+# WebKit's render process aborts and every window is blank. Same reason the
+# AppImage excludelist bans exactly this library (mesa#11316); the sibling
+# libwayland-* libs are fine to bundle and stay. -f, because a linuxdeploy
+# with the updated excludelist will stop bundling it.
+rm -f squashfs-root/usr/lib/libwayland-client.so.0
+
 # The desktop file's real copy lives under usr/share/applications, and the
 # root FrameForge.png is already a regular file, so both are safe sources.
 rm squashfs-root/FrameForge.desktop squashfs-root/.DirIcon
