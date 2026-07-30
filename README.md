@@ -126,6 +126,11 @@ Source code is fully public under GPLv3 — build and verify it yourself.
 
 ## Building From Source
 
+### Windows
+
+Build Windows from upstream rather than from this fork — see [About this
+fork](#about-this-fork) for why.
+
 ```powershell
 # Prerequisites: Node.js 20+, pnpm, Rust MSVC toolchain
 rustup default stable-x86_64-pc-windows-msvc
@@ -140,10 +145,19 @@ pnpm tauri build    # installer → src-tauri/target/release/bundle/
 ### Linux
 
 Releases carry the three packages, so building is for development or for a
-branch no release covers. The frontend and backend are started separately:
+branch no release covers.
 
 ```sh
+# Prerequisites: Node.js 20+, pnpm, a Rust toolchain, and the system
+# development headers listed in .github/actions/linux-build-deps/action.yml
+git clone https://github.com/Lyrex/FrameForge.git
+cd FrameForge
 pnpm install
+```
+
+The frontend and backend are started separately:
+
+```sh
 pnpm dev
 
 # In another terminal:
