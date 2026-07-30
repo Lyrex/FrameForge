@@ -1,0 +1,90 @@
+# Clippy is left out on purpose. The inherited upstream code has never been
+# linted, and a wall of pre-existing warnings would train everyone to ignore the
+# badge. Add it once there is a clean baseline to hold it to.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust build and tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/linux-build-deps
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # The script pins the model by checksum, so hashing the script identifies
+      # the model, and the 23 MB download happens once per model change.
+      - name: Cache the Tesseract model
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/tessdata
+          key: tessdata-${{ hashFiles('scripts/fetch-tessdata.sh') }}
+
+      # `frontendDist` is `../dist`, gitignored and so absent on a fresh
+      # checkout, and `generate_context!` panics on a path that does not exist.
+      # It tests existence and nothing more, so an empty directory compiles. The
+      # frontend job builds the real assets; nothing here serves them.
+      - name: Stand in for the frontend build
+        run: mkdir -p dist
+
+      - name: Build
+        run: cargo build --manifest-path src-tauri/Cargo.toml --locked
+
+      - name: Test
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+  frontend:
+    name: Frontend typecheck and build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm build
+
+  scripts:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: shellcheck scripts/*.sh
+
+  version:
+    name: Version consistency
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: bash scripts/check-version.sh
