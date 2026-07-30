@@ -13,14 +13,21 @@
 # pins the exact file rather than tracking the branch.
 set -euo pipefail
 
-readonly URL="https://raw.githubusercontent.com/tesseract-ocr/tessdata/main/eng.traineddata"
+# Pinned to a commit rather than `main`: a branch URL serves whatever it points at
+# now, so when upstream regenerates the file the checksum below stops matching and
+# the old bytes are unfetchable, and the only way forward is to accept a
+# different, unmeasured model. A tag would not do either, since tags can be
+# repointed. So the SHA256 guards transport and tampering, not upstream drift.
+# This is the last commit to touch the file, in May 2018.
+readonly URL="https://raw.githubusercontent.com/tesseract-ocr/tessdata/c2b2e0df86272ce11be323f23f96cf656565ed41/eng.traineddata"
 readonly SHA256="daa0c97d651c19fba3b25e81317cd697e9908c8208090c94c3905381c23fc047"
 
 dest_dir="$(dirname "$0")/../src-tauri/tessdata"
 dest="${dest_dir}/eng.traineddata"
 
-# Nothing to do when the pinned file is already in place — this runs on every
-# bundle, and the download is 23 MB.
+# `build.rs` re-runs this whenever the script or the model changes, and on any
+# fresh target directory, so this guard is what keeps the 23 MB download to once
+# per model.
 if [ -f "$dest" ] && echo "${SHA256}  ${dest}" | sha256sum --check --status; then
     exit 0
 fi
