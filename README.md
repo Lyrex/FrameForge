@@ -8,6 +8,18 @@ A desktop companion for Warframe — live inventory, market prices, trading, tim
 
 ---
 
+## About this fork
+
+This is the Linux fork of [WyrmStudios/FrameForge](https://github.com/WyrmStudios/FrameForge). The app, its name and its bundle identifier are unchanged from upstream, so the version string is what separates the two: `2.7.0+linux.1` is upstream's 2.7.0 plus this fork's Linux work, and `+linux.<n>` counts the Linux-only releases cut on that base.
+
+Releases here are Linux only: `.deb`, `.rpm` and `.AppImage`. **Windows users want [upstream's releases](https://github.com/WyrmStudios/FrameForge/releases)**, not this repository. The port reworks code the Windows paths also run — `7689b61` (log watcher), `f5ed489` (riven flag read) and `6ed6dc8` (inventory blob seed) — and none of it has been exercised on Windows, so building this fork for Windows is not the same as building upstream.
+
+The overlay stack, the `EE.log` discovery and several cross-platform fixes started from [xamionex/FrameForge-Linux](https://github.com/xamionex/FrameForge-Linux). That material was reworked here rather than taken as-is, so defects in it are ours and belong in this repository's issues, not theirs.
+
+This fork's git history is not a stability promise — it is rebased onto upstream releases, so commits move. The artifacts are the product.
+
+---
+
 ## Features
 
 ### Live Inventory
@@ -98,7 +110,7 @@ Source code is fully public under GPLv3 — build and verify it yourself.
 
 ## Requirements
 
-- Windows 10 or 11 (64-bit), or Linux running Warframe through Steam Proton (build it yourself — see below)
+- Windows 10 or 11 (64-bit) from upstream, or Linux with glibc 2.39 or newer running Warframe through Steam Proton
 - Warframe installed for inventory scanning (other features work without it)
 - [warframe.market](https://warframe.market) account for trading features (optional)
 
@@ -106,9 +118,9 @@ Source code is fully public under GPLv3 — build and verify it yourself.
 
 ## Installation
 
-1. Download the latest installer from [**Releases**](../../releases)
-2. Run it — click **More info → Run anyway** if SmartScreen warns you (no code-signing certificate)
-3. Launch FrameForge from Start or the desktop shortcut
+**Linux** — download the `.deb`, `.rpm` or `.AppImage` from [**Releases**](../../releases). Ubuntu 24.04, Debian 13 and Fedora 40 are all above the glibc floor; Debian 12 is below it and will install cleanly but fail to launch.
+
+**Windows** — download the installer from [upstream's Releases](https://github.com/WyrmStudios/FrameForge/releases), run it (click **More info → Run anyway** if SmartScreen warns you — there is no code-signing certificate), and launch FrameForge from Start or the desktop shortcut.
 
 ---
 
@@ -127,8 +139,8 @@ pnpm tauri build    # installer → src-tauri/target/release/bundle/
 
 ### Linux
 
-No Linux release is published, so build it yourself. For development the
-frontend and backend are started separately:
+Releases carry the three packages, so building is for development or for a
+branch no release covers. The frontend and backend are started separately:
 
 ```sh
 pnpm install

@@ -57,6 +57,10 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "Lyrex",
+    "category": "Game",
+    "shortDescription": "Warframe companion — inventory, market prices and relic rewards.",
+    "longDescription": "A read-only desktop companion for Warframe. Reads the account inventory out of the running game's memory, prices items against warframe.market, tracks Foundry recipes and world-state timers, and shows relic reward values as an overlay while the fissure reward screen is open.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

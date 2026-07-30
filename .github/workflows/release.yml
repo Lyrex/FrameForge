@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      # `<upstream-version>+linux.<n>`, e.g. v2.7.0+linux.1. Semver build
+      # metadata, so it sorts equal to upstream's v2.7.0 rather than before it,
+      # which is what a `-linux.1` prerelease suffix would have done.
+      - 'v*+linux.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # First, so a tree whose version disagrees with the tag costs a second
+      # rather than a ~10 minute build and an upload.
+      - name: Check the tag matches the configured version
+        run: bash scripts/check-version.sh "${GITHUB_REF#refs/tags/v}"
+
+      - uses: ./.github/actions/linux-build-deps
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Cache the Tesseract model
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/tessdata
+          key: tessdata-${{ hashFiles('scripts/fetch-tessdata.sh') }}
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # NO_STRIP=true is needed only for the AppImage: linuxdeploy bundles an
+      # old `strip` that cannot read the `.relr.dyn` sections modern
+      # distributions emit, and it aborts the bundle rather than skipping the
+      # library.
+      - name: Build bundles
+        run: NO_STRIP=true pnpm tauri build --bundles deb,rpm,appimage
+
+      # Release notes are written by hand rather than generated from commits.
+      # Every release has to state the upstream release it is based on, what was
+      # verified and on which distro, session type and compositor, and that
+      # Windows is unsupported here. None of that is derivable from the tree,
+      # which is also why the release is drafted rather than published.
+      - name: Draft the release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: ${{ github.ref_name }}
+          files: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/rpm/*.rpm
+            src-tauri/target/release/bundle/appimage/*.AppImage
