@@ -1,4 +1,4 @@
-# FrameForge — Warframe Companion `v2.8.0`
+# FrameForge — Warframe Companion `v2.8.0+linux.1`
 
 A desktop companion for Warframe — live inventory, market prices, trading, timers, relic overlay, and riven analysis. Read-only, no game modification.
 
@@ -10,13 +10,13 @@ A desktop companion for Warframe — live inventory, market prices, trading, tim
 
 ## About this fork
 
-This is the Linux fork of [WyrmStudios/FrameForge](https://github.com/WyrmStudios/FrameForge). The app, its name and its bundle identifier are unchanged from upstream, so the version string is what separates the two: `2.7.0+linux.1` is upstream's 2.7.0 plus this fork's Linux work, and `+linux.<n>` counts the Linux-only releases cut on that base.
+This is the Linux fork of [WyrmStudios/FrameForge](https://github.com/WyrmStudios/FrameForge). It exists because the Linux port was declined upstream, not because of a disagreement: upstream is the project, this is its platform branch, and fixes that are not Linux-specific are still sent upstream as individual pull requests. The app, its name and its bundle identifier are unchanged from upstream, so the version string is what separates the two: `2.8.0+linux.1` is upstream's 2.8.0 plus this fork's Linux work, and `+linux.<n>` counts the Linux-only releases cut on that base.
 
 Releases here are Linux only: `.deb`, `.rpm` and `.AppImage`. **Windows users want [upstream's releases](https://github.com/WyrmStudios/FrameForge/releases)**, not this repository. The port reworks code the Windows paths also run — `7689b61` (log watcher), `f5ed489` (riven flag read) and `6ed6dc8` (inventory blob seed) — and none of it has been exercised on Windows, so building this fork for Windows is not the same as building upstream.
 
 The overlay stack, the `EE.log` discovery and several cross-platform fixes started from [xamionex/FrameForge-Linux](https://github.com/xamionex/FrameForge-Linux). That material was reworked here rather than taken as-is, so defects in it are ours and belong in this repository's issues, not theirs.
 
-This fork's git history is not a stability promise — it is rebased onto upstream releases, so commits move. The artifacts are the product.
+Upstream releases are merged in, tag by tag ([docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md)); `main` is not rewritten.
 
 ---
 
@@ -68,10 +68,10 @@ Live dashboard from DE's worldstate API:
 - **Item Report** — track any item's quantity over time with daily snapshots and drag-to-reorder cards
 
 ### Riven Analyzer
-Analyses riven rolls against the community-curated [44bananas spreadsheet](https://docs.google.com/spreadsheets/d/1zbaeJBuBn44cbVKzJins_E3hTDpnmvOk8heYN-G8yy8) (413+ weapons). Click **Check Riven** while the riven screen is open for instant per-stat quality ratings. Comparison mode shows old vs new roll side-by-side after each cycle. Supports primary, secondary, melee, and archwing weapons.
+Analyses riven rolls against the community-curated [44bananas spreadsheet](https://docs.google.com/spreadsheets/d/1zbaeJBuBn44cbVKzJins_E3hTDpnmvOk8heYN-G8yy8) (413+ weapons). Click **Check Riven** while the riven screen is open for instant per-stat quality ratings. Comparison mode shows old vs new roll side-by-side after each cycle. Supports primary, secondary, melee, and archwing weapons. On Linux, Alt-Tab out of the game before clicking the overlay's buttons — the game keeps the pointer grab until it loses focus.
 
 ### OCR Relic Reward Overlay
-When a void fissure reward screen opens, FrameForge automatically captures it via Windows OCR and shows a transparent overlay with platinum price, ducat value, and set completion for each card. Priority mode: Completion / Plat / Ducats / Set Value.
+When a void fissure reward screen opens, FrameForge automatically captures it — via WinRT OCR on Windows, Tesseract on Linux — and shows a transparent overlay with platinum price, ducat value, and set completion for each card. Priority mode: Completion / Plat / Ducats / Set Value.
 
 The item catalog used for OCR matching is built exclusively from known relic reward names — no false matches from non-reward items. Survival fissure multi-round sessions are fully supported: the selected relic carries over between rounds correctly.
 
@@ -102,7 +102,7 @@ Everything else (Foundry, Market, Relics, Timers, Statistics) runs on public dat
 | Memory access | Read-only `ReadProcessMemory` — never writes, never injects |
 | Game modification | None |
 | Network | warframe.market, DE worldstate, WFCD GitHub repos, FrameForgePricing mirror. No FrameForge server, no telemetry |
-| Credentials | WFM token in Windows Credential Manager. Warframe API credentials never written to disk |
+| Credentials | WFM token in Windows Credential Manager (on Linux the session is not saved). Warframe API credentials never written to disk |
 
 Source code is fully public under GPLv3 — build and verify it yourself.
 
@@ -200,7 +200,7 @@ hidden rather than offered.
 
 - No account required for most features
 - No telemetry — no FrameForge server
-- All data stored locally at `%LOCALAPPDATA%\warframe-companion\`
+- All data stored locally at `%LOCALAPPDATA%\warframe-companion\` (Windows) or `~/.local/share/warframe-companion/` (Linux)
 - WFM session token stored in Windows Credential Manager if "Stay logged in" is enabled
 
 ---
