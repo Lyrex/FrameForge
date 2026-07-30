@@ -150,8 +150,8 @@ branch no release covers.
 ```sh
 # Prerequisites: Node.js 20+, pnpm, a Rust toolchain, and the system
 # development headers listed in .github/actions/linux-build-deps/action.yml
-git clone https://github.com/Lyrex/FrameForge.git
-cd FrameForge
+git clone https://github.com/Lyrex/FrameForge-Linux.git
+cd FrameForge-Linux
 pnpm install
 ```
 
