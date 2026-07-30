@@ -57,7 +57,7 @@ jobs:
 
       # https://github.com/rust-lang/cargo/issues/6669
       - name: cargo test --doc
-        run: cargo test --locked --doc
+        run: cargo test --doc --manifest-path src-tauri/Cargo.toml --locked
 
   frontend:
     name: Frontend typecheck and build
