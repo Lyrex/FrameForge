@@ -17,7 +17,50 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      scripts: ${{ steps.filter.outputs.scripts }}
+      version: ${{ steps.filter.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # tag=v4.0.2
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'src-tauri/**'
+              - '.github/workflows/ci.yml'
+              - '.github/actions/linux-build-deps/**'
+              - 'scripts/fetch-tessdata.sh'
+            frontend:
+              - 'src/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - 'tsconfig*.json'
+              - 'vite.config.*'
+              - 'index.html'
+              - '.github/workflows/ci.yml'
+            scripts:
+              - 'scripts/**'
+              - '.github/workflows/ci.yml'
+            version:
+              - 'package.json'
+              - 'src-tauri/Cargo.toml'
+              - 'src-tauri/tauri.conf.json'
+              - 'scripts/check-version.sh'
+              - '.github/workflows/ci.yml'
+
   rust:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true'
     name: Rust build and tests
     runs-on: ubuntu-latest
     steps:
@@ -60,6 +103,8 @@ jobs:
         run: cargo test --doc --manifest-path src-tauri/Cargo.toml --locked
 
   frontend:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.frontend == 'true'
     name: Frontend typecheck and build
     runs-on: ubuntu-latest
 
@@ -85,6 +130,8 @@ jobs:
       - run: pnpm build
 
   scripts:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.scripts == 'true'
     name: Shellcheck
     runs-on: ubuntu-latest
 
@@ -94,6 +141,8 @@ jobs:
       - run: shellcheck scripts/*.sh
 
   version:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.version == 'true'
     name: Version consistency
     runs-on: ubuntu-latest
 
