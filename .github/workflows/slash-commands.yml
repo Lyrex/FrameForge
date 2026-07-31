@@ -25,7 +25,7 @@ jobs:
       # /pending-feedback — remove needs-triage, add Closed - Pending Feedback
       - name: pending-feedback
         if: steps.parse.outputs.command == '/pending-feedback'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const issue = context.issue.number;
@@ -50,7 +50,7 @@ jobs:
       # /confirmed — remove needs-triage, add confirmed
       - name: confirmed
         if: steps.parse.outputs.command == '/confirmed'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const issue = context.issue.number;
@@ -65,7 +65,7 @@ jobs:
       # /wontfix — remove needs-triage, add wontfix, close issue
       - name: wontfix
         if: steps.parse.outputs.command == '/wontfix'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const issue = context.issue.number;
@@ -81,7 +81,7 @@ jobs:
       # /duplicate — remove needs-triage, add duplicate, close issue
       - name: duplicate
         if: steps.parse.outputs.command == '/duplicate'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const issue = context.issue.number;
@@ -97,7 +97,7 @@ jobs:
       # /parked — remove needs-triage, add Parked, close issue
       - name: parked
         if: steps.parse.outputs.command == '/parked'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const issue = context.issue.number;
@@ -113,7 +113,7 @@ jobs:
       # /in-progress — remove needs-triage, add in-progress
       - name: in-progress
         if: steps.parse.outputs.command == '/in-progress'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const issue = context.issue.number;
@@ -128,7 +128,7 @@ jobs:
       # /resolved — add resolved, close issue
       - name: resolved
         if: steps.parse.outputs.command == '/resolved'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const issue = context.issue.number;
