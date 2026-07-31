@@ -631,6 +631,26 @@ pub fn compute_riven_mod_name(buffs: &[BlobRivenStat]) -> String {
     format!("{}{}", hi_p.to_lowercase(), lo_s.to_lowercase())
 }
 
+/// Cut the JSON object out of a stitched memory buffer.
+///
+/// A scan buffer is whole memory regions glued together, so the blob's last
+/// brace is followed by whatever heap bytes happened to sit in the tail of the
+/// final region — potentially tens of megabytes of noise. This trims to just
+/// the valid JSON object so both the parser and the debug dump files see clean data.
+pub fn extract_blob_json(raw: &[u8]) -> Option<Vec<u8>> {
+    let end_pos = find_blob_end(raw)?;
+    if raw.first() == Some(&b'{') {
+        Some(raw[..end_pos].to_vec())
+    } else {
+        const START: &[u8] = b"\"SubscribedToEmails\"";
+        let start_pos = raw.windows(START.len()).position(|w| w == START)?;
+        let mut v = Vec::with_capacity(end_pos - start_pos + 1);
+        v.push(b'{');
+        v.extend_from_slice(&raw[start_pos..end_pos]);
+        Some(v)
+    }
+}
+
 /// `raw` must span from the JSON opening `{` (or from `"SubscribedToEmails"`) through
 /// `"DeathSquadable":`. Returns `None` if neither start can be located or JSON is malformed.
 pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
@@ -644,19 +664,7 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
         return None;
     }
 
-    // capture_all_blobs seeds from the JSON opening { so raw already forms a complete
-    // JSON object — use it directly. Fall back to the old SubscribedToEmails approach
-    // for any caller that still passes data starting inside the object.
-    let json_bytes: Vec<u8> = if raw.first() == Some(&b'{') {
-        raw[..end_pos].to_vec()
-    } else {
-        const START: &[u8] = b"\"SubscribedToEmails\"";
-        let start_pos = raw.windows(START.len()).position(|w| w == START)?;
-        let mut v = Vec::with_capacity(end_pos - start_pos + 1);
-        v.push(b'{');
-        v.extend_from_slice(&raw[start_pos..end_pos]);
-        v
-    };
+    let json_bytes = extract_blob_json(raw)?;
 
     let json: serde_json::Value = serde_json::from_slice(&json_bytes)
         .map_err(|e| {
@@ -1142,10 +1150,9 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
                         if save {
                             let name = format!("Actual_inventory_FULL_ACCOUNT_{}_{:02}.txt", ts, saved + 1);
                             let path = blob_dir.join(&name);
-                            let text: Vec<u8> = scan.data.iter()
-                                .map(|&b| if b >= 0x20 && b <= 0x7e || b == b'\n' || b == b'\t' { b } else { b'.' })
-                                .collect();
-                            if std::fs::write(&path, &text).is_ok() { saved += 1; }
+                            if let Some(json) = extract_blob_json(&scan.data) {
+                                if std::fs::write(&path, &json).is_ok() { saved += 1; }
+                            }
                         }
                         blob_tx.send(inv).ok();
                         found_result = true;
@@ -1236,7 +1243,9 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
                         LAST_BLOB_REGION.store(seed_addr as u64, std::sync::atomic::Ordering::Relaxed);
                         if save {
                             let name = format!("Actual_inventory_FULL_ACCOUNT_{}_{:02}.txt", ts, saved + 1);
-                            if std::fs::write(blob_dir.join(&name), &seed).is_ok() { saved += 1; }
+                            if let Some(json) = extract_blob_json(&seed) {
+                                if std::fs::write(blob_dir.join(&name), &json).is_ok() { saved += 1; }
+                            }
                         }
                         blob_tx.send(inv).ok();
                         found_result = true;
@@ -1507,7 +1516,7 @@ fn find_warframe_pid() -> Option<u32> {
 
 #[cfg(test)]
 mod seed_tests {
-    use super::{enclosing_object_start, blob_seed_offsets};
+    use super::{enclosing_object_start, blob_seed_offsets, extract_blob_json};
 
     #[test]
     fn enclosing_finds_outer_brace() {
@@ -1555,5 +1564,18 @@ mod seed_tests {
         let buf = b"x\"SubscribedToEmails\":1}";
         let (marker_off, json_open) = blob_seed_offsets(buf);
         assert_eq!(json_open, marker_off);
+    }
+
+    #[test]
+    fn blob_json_stops_at_the_closing_brace_of_the_object() {
+        // A stitched scan buffer: the blob, then the rest of the memory region
+        // it happened to end in.
+        let mut raw = br#"{"SubscribedToEmails":0,"DeathSquadable":false}"#.to_vec();
+        let blob_len = raw.len();
+        raw.extend(std::iter::repeat(0xABu8).take(1_000_000));
+
+        let json = extract_blob_json(&raw).expect("end marker present");
+        assert_eq!(json.len(), blob_len);
+        assert!(serde_json::from_slice::<serde_json::Value>(&json).is_ok());
     }
 }

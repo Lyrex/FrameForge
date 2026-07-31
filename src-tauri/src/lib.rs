@@ -1745,11 +1745,10 @@ async fn get_wfm_top_items(state: State<'_, AppState>) -> Result<Vec<WfmTopItem>
 }
 
 /// Save the WFM access token to Windows Credential Manager (encrypted by the OS).
-/// Stored under "FrameForge_WFM" — username field = "token", password = JWT value.
+/// Stored under "FrameForge_WFM" — username field = the email, blob = the token.
 #[tauri::command]
 #[cfg(target_os = "windows")]
-fn wfm_save_credentials(email: String, password: String) -> Result<(), String> {
-    let _ = email; // kept for API compatibility; we save the JWT passed as password
+fn wfm_save_credentials(email: String, token: String) -> Result<(), String> {
     use windows_sys::Win32::Security::Credentials::{
         CredWriteW, CREDENTIALW, CRED_TYPE_GENERIC, CRED_PERSIST_LOCAL_MACHINE,
     };
@@ -1758,7 +1757,7 @@ fn wfm_save_credentials(email: String, password: String) -> Result<(), String> {
 
     let target: Vec<u16> = OsStr::new("FrameForge_WFM").encode_wide().chain(Some(0)).collect();
     let user:   Vec<u16> = OsStr::new(&email).encode_wide().chain(Some(0)).collect();
-    let pass_bytes = password.as_bytes();
+    let token_bytes = token.as_bytes();
 
     let cred = CREDENTIALW {
         Flags: 0,
@@ -1766,8 +1765,8 @@ fn wfm_save_credentials(email: String, password: String) -> Result<(), String> {
         TargetName: target.as_ptr() as *mut _,
         Comment: std::ptr::null_mut(),
         LastWritten: unsafe { std::mem::zeroed() },
-        CredentialBlobSize: pass_bytes.len() as u32,
-        CredentialBlob: pass_bytes.as_ptr() as *mut _,
+        CredentialBlobSize: token_bytes.len() as u32,
+        CredentialBlob: token_bytes.as_ptr() as *mut _,
         Persist: CRED_PERSIST_LOCAL_MACHINE,
         AttributeCount: 0,
         Attributes: std::ptr::null_mut(),
@@ -1802,19 +1801,22 @@ fn wfm_load_credentials() -> Result<Option<(String, String)>, String> {
             String::from_utf16_lossy(slice::from_raw_parts(ptr, len))
         }
     };
-    let password = unsafe {
+    let token = unsafe {
         if cred.CredentialBlob.is_null() || cred.CredentialBlobSize == 0 { String::new() } else {
             String::from_utf8_lossy(slice::from_raw_parts(cred.CredentialBlob, cred.CredentialBlobSize as usize)).to_string()
         }
     };
     unsafe { CredFree(cred_ptr as *mut _); }
-    Ok(Some((email, password)))
+    Ok(Some((email, token)))
 }
 
 /// Delete saved WFM credentials from Windows Credential Manager.
+///
+/// Async only so that every platform's delete has one shape for `wfm_logout` to
+/// await; `CredDeleteW` itself returns immediately and never prompts.
 #[tauri::command]
 #[cfg(target_os = "windows")]
-fn wfm_delete_credentials() -> Result<(), String> {
+async fn wfm_delete_credentials() -> Result<(), String> {
     use windows_sys::Win32::Security::Credentials::{CredDeleteW, CRED_TYPE_GENERIC};
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
@@ -1824,9 +1826,17 @@ fn wfm_delete_credentials() -> Result<(), String> {
 }
 
 /// Clear the stored WFM session.
+///
+/// A saved token outlives the in-memory session: the next launch restores it
+/// before the user sees anything, so a logout that only cleared memory would
+/// appear not to have happened. The delete sits here rather than at the call
+/// site so every route to a logout inherits it.
 #[tauri::command]
-fn wfm_logout(state: State<AppState>) {
+async fn wfm_logout(state: State<'_, AppState>) -> Result<(), String> {
+    // Binding the guard to a name would hold a std mutex across the await below
+    // and make the future non-Send.
     *state.wfm_session.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    wfm_delete_credentials().await
 }
 
 /// Return (username, status) for the current session, or None if not logged in.
@@ -5078,7 +5088,6 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
             // We accumulate it across poll iterations so it's ready when OCR starts.
             let mut vp_in_seq        = false;
             let mut vp_seq_completed = false; // set when sequence finishes; used as fallback trigger
-            let mut pending_trade: Option<String> = None; // last seen trade confirmation dialog
             let mut vp_other_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut vp_own_item = String::new(); // local player's reward path from EE.log
             // Cooldown: after any dismiss, block new triggers for 5 s to filter
@@ -5281,37 +5290,6 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                 // Unveil: riven challenge completion
                 if lower.contains("modreveal") || (lower.contains("riven") && lower.contains("unveiled")) {
                     let _ = ee_ocr_app.emit("riven-unveiled", ());
-                }
-
-                // ── In-game trade detection ──────────────────────────────────────
-                // Warframe writes a confirmation dialog to EE.log when the trade
-                // window is accepted, then a success dialog when it completes.
-                //
-                // Confirmation: Dialog::CreateOkCancel(description=Are you sure you
-                //   want to accept this trade? You are offering:\nPlatinum x N\n
-                //   and will receive from PLAYER the following:\nITEM, title=...)
-                //
-                // Success: Dialog::CreateOk(description=The trade was successful!...)
-                if lower.contains("dialog::createokcancel") && lower.contains("you are offering") {
-                    pending_trade = Some(buf.clone());
-                }
-
-                if lower.contains("the trade was successful") {
-                    if let Some(ref trade_raw) = pending_trade.clone() {
-                        if let Some(t) = parse_trade_dialog(trade_raw) {
-                            let _ = ee_ocr_app.emit("trade-completed", serde_json::json!({
-                                "sessionId":     t.session_id,
-                                "withPlayer":    t.with_player,
-                                "tradeType":     t.trade_type,
-                                "offeredItems":  t.offered_items.iter().map(|(n, q)| serde_json::json!({"name": n, "qty": q})).collect::<Vec<_>>(),
-                                "offeredPlat":   t.offered_plat,
-                                "receivedItems": t.received_items.iter().map(|(n, q)| serde_json::json!({"name": n, "qty": q})).collect::<Vec<_>>(),
-                                "receivedPlat":  t.received_plat,
-                                "timestamp":     t.timestamp,
-                            }));
-                        }
-                    }
-                    pending_trade = None;
                 }
 
                 // Trigger: "VoidProjections: GetVoidProjectionReward[s]" fires when the
@@ -6742,10 +6720,13 @@ fn parse_worldstate_value(raw: &serde_json::Value, now_ms: i64, catalog: &std::c
         .unwrap_or(Value::Null);
 
     // ── Kahl / Break Narmer ───────────────────────────────────────────────
-    let kahl = raw["SyndicateMissions"].as_array()
-        .and_then(|a| a.iter().find(|m| m["Tag"].as_str() == Some("KahlSyndicate")))
-        .map(|m| {
-            let expiry_ms = ws_ms(&m["Expiry"]);
+    // KahlSyndicate in SyndicateMissions is the daily bounty rotation, not the
+    // weekly mission. Kahl's weekly missions reset on the same Monday schedule
+    // as the Archon Hunt (LiteSorties), so we borrow that expiry.
+    let kahl = raw["LiteSorties"].as_array()
+        .and_then(|a| a.first())
+        .map(|s| {
+            let expiry_ms = ws_ms(&s["Expiry"]);
             json!({ "expiry": ms_to_iso(expiry_ms) })
         })
         .unwrap_or(Value::Null);

@@ -118,6 +118,20 @@ function nextWeeklyReset(): string {
   return new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate() + (d === 0 ? 1 : 8 - d))).toISOString();
 }
 
+const DUVIRI_EPOCH_MS = 1679450400000; // 2023-03-22T02:00:00.000Z
+const DUVIRI_MOOD_MS  = 7_200_000;     // 2 hours per mood
+const DUVIRI_MOODS    = ["Joy", "Anger", "Envy", "Sorrow", "Fear", "Neutral"] as const;
+type DuviriMood = typeof DUVIRI_MOODS[number];
+const DUVIRI_MOOD_CLASS: Record<DuviriMood, string> = {
+  Joy: "st-joy", Anger: "st-anger", Envy: "st-envy",
+  Sorrow: "st-sorrow", Fear: "st-fear", Neutral: "st-neutral",
+};
+function duviriNow(now: number): { mood: DuviriMood; expiry: string; index: number } {
+  const idx   = Math.floor((now - DUVIRI_EPOCH_MS) / DUVIRI_MOOD_MS) % DUVIRI_MOODS.length;
+  const next  = DUVIRI_EPOCH_MS + (Math.floor((now - DUVIRI_EPOCH_MS) / DUVIRI_MOOD_MS) + 1) * DUVIRI_MOOD_MS;
+  return { mood: DUVIRI_MOODS[idx], expiry: new Date(next).toISOString(), index: idx };
+}
+
 const TIER_COLOR: Record<string, string> = {
   Lith: "#c8853a", Meso: "#a8a9ad", Neo: "#f0c040",
   Axi: "#e5c04a", Requiem: "#9b6dff", Omnia: "#e0e0e0",
@@ -141,6 +155,7 @@ export const TIMER_LABELS: Record<string, string> = {
   "nightwave":        "Nightwave",
   "prime-resurgence": "Prime Resurgence",
   "circuit":        "The Circuit",
+  "duviri-spiral":  "Duviri Spiral",
   "kahl":           "Kahl / Break Narmer",
   "deep-archimedea":"Deep Archimedea",
 };
@@ -163,6 +178,7 @@ export function getTimerInfo(id: string, ws: WorldState): { state: string; expir
     case "void-trader":    return ws.voidTrader ? { state: ws.voidTrader.active ? "Here" : "Away", expiry: ws.voidTrader.active ? ws.voidTrader.expiry : ws.voidTrader.activation } : null;
     case "nightwave":         return ws.nightwave?.active ? { state: `S${ws.nightwave.season}`, expiry: ws.nightwave.expiry } : null;
     case "prime-resurgence":  return ws.primeResurgence?.active ? { state: "Active", expiry: ws.primeResurgence.expiry } : null;
+    case "duviri-spiral": { const d = duviriNow(Date.now()); return { state: d.mood, expiry: d.expiry }; }
     case "circuit":        return ws.circuit    ? { state: "Weekly",  expiry: ws.circuit.expiry }        : null;
     case "kahl":           return ws.kahl       ? { state: "Weekly",  expiry: ws.kahl.expiry }           : null;
     case "deep-archimedea":return ws.deepArchimedea ? { state: "Weekly", expiry: ws.deepArchimedea.expiry } : null;
@@ -308,6 +324,29 @@ export default function TimerHelper({ favorites, onFavoriteToggle, fissureWatche
         {ws?.cambion  && <TimerTile id="cambion-cycle" label="Cambion Drift" state="Active"                               stateClass="st-fass"                                 expiry={ws.cambion.expiry} until="next cycle" />}
         {ws?.zariman  && <TimerTile id="zariman-cycle" label="Zariman"       state="Active"                               stateClass="st-neutral"                              expiry={ws.zariman.expiry} until="reset" />}
       </div>
+      {/* Duviri Spiral — deterministic 12h cycle, no worldstate needed */}
+      {(() => {
+        const dv   = duviriNow(now);
+        const open = openInventory.has("duviri-spiral");
+        return (
+          <div className={`exp-tile${open ? " open" : ""}`} onClick={() => toggleInventory("duviri-spiral")}>
+            <ExpHeader id="duviri-spiral" name="Duviri Spiral" state={dv.mood} sc={DUVIRI_MOOD_CLASS[dv.mood]} countdown={cd(dv.expiry)} open={open} />
+            {open && (
+              <div className="duviri-spiral">
+                {DUVIRI_MOODS.map((mood, i) => {
+                  const chipIdx = (dv.index + i) % DUVIRI_MOODS.length;
+                  const chipMood = DUVIRI_MOODS[chipIdx];
+                  return (
+                    <span key={mood} className={`duviri-mood-chip ${DUVIRI_MOOD_CLASS[chipMood]}${chipIdx === dv.index ? " active" : ""}`}>
+                      {chipMood}
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* ── Bounties ──────────────────────────────────────────────────────── */}
       {ws?.bounties && Object.keys(ws.bounties).length > 0 && (

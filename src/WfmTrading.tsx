@@ -37,6 +37,20 @@ interface WfmWhisper {
 
 interface WfmItemEntry { id: string; item_name: string; url_name: string; }
 
+interface ListingChangeEntry {
+  id: string;
+  timestamp: number;
+  action: "decreased" | "completed";
+  itemName: string;
+  withPlayer: string;
+  platinum: number;
+  oldQty: number;
+  newQty: number;
+  revertInfo: NonNullable<WfmWhisper["revertInfo"]>;
+  reverting?: boolean;
+  reverted?: boolean;
+}
+
 interface WfmRivenAttribute {
   url_name: string;
   positive: boolean;
@@ -123,7 +137,7 @@ function LoginPanel({ onLogin }: { onLogin: (u: string) => void }) {
       const username = await invoke<string>("wfm_login", { email, password });
       if (remember) {
         const tokenJson = await invoke<string | null>("wfm_get_jwt").catch(() => null);
-        if (tokenJson) invoke("wfm_save_credentials", { email, password: tokenJson }).catch(() => {});
+        if (tokenJson) invoke("wfm_save_credentials", { email, token: tokenJson }).catch(() => {});
       }
       onLogin(username);
     } catch (e) { setError(String(e)); setLoading(false); }
@@ -458,9 +472,11 @@ function RivensSection({ rivenOrders, itemIdMap, auctionRefreshKey, onEditOrder,
   );
 }
 
-function ListingsPanel({ username: _username, itemIdMap, wfmItems, imageMap, auctionRefreshKey }: {
+function ListingsPanel({ username: _username, itemIdMap, wfmItems, imageMap, auctionRefreshKey, changelog, onUndo }: {
   username: string; itemIdMap: Map<string, string>; wfmItems: WfmItemEntry[]; imageMap: Map<string, string>;
   auctionRefreshKey?: number;
+  changelog?: ListingChangeEntry[];
+  onUndo?: (entry: ListingChangeEntry) => void;
 }) {
   const [orders, setOrders] = useState<{ sell: WfmOrder[]; buy: WfmOrder[] }>({ sell: [], buy: [] });
   const [loading, setLoading] = useState(true);
@@ -598,13 +614,47 @@ function ListingsPanel({ username: _username, itemIdMap, wfmItems, imageMap, auc
         onToggleOrderVisible={toggleOrderVisible}
         onBulkOrdersVisible={bulkRivenOrdersVisible}
       />
+      {changelog && changelog.length > 0 && (
+        <div className="wfm-changelog">
+          <div className="wfm-section-label">Auto-updated listings</div>
+          {changelog.map(entry => (
+            <div key={entry.id} className={`wfm-changelog-row${entry.reverted ? " wfm-changelog-reverted" : ""}`}>
+              <span className={`wfm-changelog-badge ${entry.action}`}>
+                {entry.action === "decreased" ? "−" : "✓"}
+              </span>
+              <span className="wfm-changelog-text">
+                {entry.action === "decreased"
+                  ? <><strong>{entry.itemName}</strong> ({entry.platinum}p) ×{entry.oldQty} → ×{entry.newQty}</>
+                  : <><strong>{entry.itemName}</strong> ({entry.platinum}p) listing completed &amp; removed</>
+                }
+                <span className="wfm-changelog-player"> · {entry.withPlayer}</span>
+              </span>
+              <span className="wfm-changelog-time">{new Date(entry.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+              {!entry.reverted && onUndo && (
+                <button
+                  className="wfm-btn-sm wfm-btn-revert"
+                  disabled={entry.reverting}
+                  onClick={() => onUndo(entry)}
+                >
+                  {entry.reverting ? "Undoing…" : "↺ Undo"}
+                </button>
+              )}
+              {entry.reverted && <span className="wfm-changelog-reverted-label">Reverted</span>}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
 // ── Messages panel ────────────────────────────────────────────────────────────
 
-function MessagesPanel({ username: _username, wfmItems }: { username: string; wfmItems: WfmItemEntry[] }) {
+function MessagesPanel({ username: _username, wfmItems, onListingChange }: {
+  username: string;
+  wfmItems: WfmItemEntry[];
+  onListingChange?: (entry: Omit<ListingChangeEntry, "id" | "reverting" | "reverted">) => void;
+}) {
   const [whispers, setWhispers] = useState<WfmWhisper[]>([]);
   const [copied, setCopied]     = useState<string | null>(null);
   const [reverting, setReverting] = useState<number | null>(null);
@@ -710,6 +760,17 @@ function MessagesPanel({ username: _username, wfmItems }: { username: string; wf
               } else {
                 await invokeWfm("wfm_delete_order", { orderId: match.id });
               }
+
+              onListingChange?.({
+                timestamp: Date.now(),
+                action: newQty > 0 ? "decreased" : "completed",
+                itemName: soldItem.name,
+                withPlayer,
+                platinum: match.platinum,
+                oldQty: originalQty,
+                newQty,
+                revertInfo,
+              });
 
               // Attach revertInfo to the ghost for the first matched item
               setWhispers(prev => {
@@ -866,9 +927,33 @@ export default function WfmTrading({ wfmLookup: _wfmLookup, wfmItems, imageMap, 
   const [wfmStatus, setWfmStatus]       = useState<"online" | "ingame" | "invisible" | "offline">("offline");
   const [statusBusy, setStatusBusy]     = useState(false);
   const [statusError, setStatusError]   = useState("");
+  const [listingChangelog, setListingChangelog] = useState<ListingChangeEntry[]>([]);
   // The status the user actually wants — used to auto-reapply when WFM drops us to offline
   const targetStatusRef  = useRef<"online" | "ingame" | "invisible" | null>(null);
   const reconnectingRef  = useRef(false);
+
+  const handleListingChange = useCallback((entry: Omit<ListingChangeEntry, "id" | "reverting" | "reverted">) => {
+    setListingChangelog(prev => [
+      { ...entry, id: `${entry.timestamp}-${Math.random().toString(36).slice(2, 7)}` },
+      ...prev,
+    ].slice(0, 50));
+  }, []);
+
+  const handleUndo = useCallback(async (entry: ListingChangeEntry) => {
+    setListingChangelog(prev => prev.map(e => e.id === entry.id ? { ...e, reverting: true } : e));
+    try {
+      const { orderId, itemId, platinum, originalQty, newQty, visible } = entry.revertInfo;
+      if (newQty > 0) {
+        await invokeWfm("wfm_update_order", { orderId, platinum, quantity: originalQty, visible });
+      } else {
+        await invokeWfm("wfm_create_order", { itemId, orderType: "sell", platinum, quantity: originalQty, visible });
+      }
+      setListingChangelog(prev => prev.map(e => e.id === entry.id ? { ...e, reverted: true, reverting: false } : e));
+    } catch (err) {
+      console.error("[undo listing]", err);
+      setListingChangelog(prev => prev.map(e => e.id === entry.id ? { ...e, reverting: false } : e));
+    }
+  }, []);
 
   const syncStatus = () => {
     invoke<string>("wfm_fetch_status")
@@ -905,9 +990,12 @@ export default function WfmTrading({ wfmLookup: _wfmLookup, wfmItems, imageMap, 
         if (creds) {
           try {
             [resolvedUser] = await invoke<[string, string]>("wfm_set_jwt", { jwt: creds[1] });
-            // Re-save with any newly-fetched CSRF token so it persists across restarts
+            // Re-save with any newly-fetched CSRF token so it persists across
+            // restarts, under the same email it was stored with. Failing here
+            // is not worth reporting: nobody asked for it, and the token
+            // already on disk still works.
             const tokenJson = await invoke<string | null>("wfm_get_jwt").catch(() => null);
-            if (tokenJson) await invoke("wfm_save_credentials", { email: "token", password: tokenJson }).catch(() => {});
+            if (tokenJson) await invoke("wfm_save_credentials", { email: creds[0], token: tokenJson }).catch(() => {});
           } catch { /* token expired — show login form */ }
         }
       }
@@ -1008,10 +1096,14 @@ export default function WfmTrading({ wfmLookup: _wfmLookup, wfmItems, imageMap, 
         </div>
       )}
 
-      {tab === "listings"
-        ? <ListingsPanel username={username} itemIdMap={new Map(wfmItems.map(i => [i.id, i.item_name]))} wfmItems={wfmItems} imageMap={imageMap} auctionRefreshKey={auctionRefreshKey} />
-        : <MessagesPanel username={username} wfmItems={wfmItems} />
-      }
+      {/* Both panels stay mounted so MessagesPanel's trade-completed listener
+          fires even when the user is on the Listings tab. */}
+      <div style={{ display: tab === "listings" ? "contents" : "none" }}>
+        <ListingsPanel username={username} itemIdMap={new Map(wfmItems.map(i => [i.id, i.item_name]))} wfmItems={wfmItems} imageMap={imageMap} auctionRefreshKey={auctionRefreshKey} changelog={listingChangelog} onUndo={handleUndo} />
+      </div>
+      <div style={{ display: tab === "messages" ? "contents" : "none" }}>
+        <MessagesPanel username={username} wfmItems={wfmItems} onListingChange={handleListingChange} />
+      </div>
     </div>
   );
 }

@@ -1,4 +1,4 @@
-# FrameForge — Warframe Companion `v2.8.0`
+# FrameForge — Warframe Companion `v2.9.0`
 
 A desktop companion for Warframe — live inventory, market prices, trading, timers, relic overlay, and riven analysis. Read-only, no game modification.
 
@@ -31,7 +31,7 @@ Full warframe.market integration — manage active listings, post new orders, an
 
 - **One-click whisper copy** — every order row has a 📋 button that copies the correct WFM trade message to your clipboard: `I want to buy` from sellers, `I want to sell` to buyers.
 - **Auto trade detection** — when a trade completes in-game, the matching WFM whisper is automatically marked complete, the sold reply is copied to your clipboard, and the whisper stays visible as a ghost for 5 minutes.
-- **Auto listing update** — after a sale is detected, the corresponding WFM sell listing is automatically decremented (or deleted if the last copy). A Revert button appears on the ghost whisper to undo the change if needed.
+- **Auto listing update** — after a sale is detected, the corresponding WFM sell listing is automatically decremented (or deleted if the last copy). Works regardless of which tab is active. An **Auto-updated listings** changelog at the bottom of the Listings tab shows every automatic change with an Undo button per entry.
 - **Status auto-reconnect** — if WFM drops your status to offline, it is automatically restored without any action needed. Session token stored in Windows Credential Manager.
 - **Riven auction management** — view all active riven auctions with AUC/DIR badges, starting price, and buyout price. Edit price, visibility, and auction type (AUC↔DIR) via a dedicated popup. Type switching is handled server-side with a guaranteed full data fetch.
 - **In-app WFM login** — authenticate via a built-in WebView browser popup instead of entering credentials manually.
