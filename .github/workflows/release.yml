@@ -3,10 +3,14 @@ name: Release
 on:
   push:
     tags:
-      # `<upstream-version>+linux.<n>`, e.g. v2.7.0+linux.1. Semver build
-      # metadata, so it sorts equal to upstream's v2.7.0 rather than before it,
-      # which is what a `-linux.1` prerelease suffix would have done.
-      - 'v*\+linux.*'
+      # `<upstream-version>-linux.<n>`, e.g. v2.9.0-linux.3. Semver prerelease,
+      # not build metadata: `+linux.<n>` compares equal for every n (semver
+      # ignores build metadata), so an updater could never tell linux.2 from
+      # linux.3, and the `+` shows up URL-encoded in release asset links.
+      # Prerelease does sort before the bare upstream version, but this repo
+      # never publishes a bare-version artifact, so nothing compares against
+      # one.
+      - 'v*-linux.*'
 
 permissions:
   contents: write
@@ -65,8 +69,18 @@ jobs:
       - name: Materialize the AppImage root metadata
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends squashfs-tools
+          sudo apt-get install -y --no-install-recommends squashfs-tools zsync
           bash scripts/fix-appimage.sh src-tauri/target/release/bundle/appimage/*.AppImage
+
+      # The AppImage embeds gh-releases-zsync update information (see
+      # fix-appimage.sh), which updaters resolve against this index. The URL
+      # inside the index is just the filename: the updater fetches it relative
+      # to wherever it found the .zsync, i.e. the same release.
+      - name: Make the AppImage zsync index
+        run: |
+          cd src-tauri/target/release/bundle/appimage
+          appimage=$(basename ./*.AppImage)
+          zsyncmake -u "$appimage" "$appimage"
 
       # Release notes are written by hand rather than generated from commits.
       # Every release has to state the upstream release it is based on, what was
@@ -82,3 +96,4 @@ jobs:
             src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/rpm/*.rpm
             src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/appimage/*.AppImage.zsync
