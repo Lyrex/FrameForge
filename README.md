@@ -1,4 +1,4 @@
-# FrameForge — Warframe Companion `v2.8.0+linux.2`
+# FrameForge — Warframe Companion `v2.9.0+linux.1`
 
 A desktop companion for Warframe — live inventory, market prices, trading, timers, relic overlay, and riven analysis. Read-only, no game modification.
 
@@ -10,7 +10,7 @@ A desktop companion for Warframe — live inventory, market prices, trading, tim
 
 ## About this fork
 
-This is the Linux fork of [WyrmStudios/FrameForge](https://github.com/WyrmStudios/FrameForge). It exists because the Linux port was declined upstream, not because of a disagreement: upstream is the project, this is its platform branch, and fixes that are not Linux-specific are still sent upstream as individual pull requests. The app, its name and its bundle identifier are unchanged from upstream, so the version string is what separates the two: `2.8.0+linux.1` is upstream's 2.8.0 plus this fork's Linux work, and `+linux.<n>` counts the Linux-only releases cut on that base.
+This is the Linux fork of [WyrmStudios/FrameForge](https://github.com/WyrmStudios/FrameForge). It exists because the Linux port was declined upstream, not because of a disagreement: upstream is the project, this is its platform branch, and fixes that are not Linux-specific are still sent upstream as individual pull requests. The app, its name and its bundle identifier are unchanged from upstream, so the version string is what separates the two: `2.9.0+linux.1` is upstream's 2.9.0 plus this fork's Linux work, and `+linux.<n>` counts the Linux-only releases cut on that base.
 
 Releases here are Linux only: `.deb`, `.rpm` and `.AppImage`. **Windows users want [upstream's releases](https://github.com/WyrmStudios/FrameForge/releases)**, not this repository.
 
@@ -45,7 +45,7 @@ Full warframe.market integration — manage active listings, post new orders, an
 
 - **One-click whisper copy** — every order row has a 📋 button that copies the correct WFM trade message to your clipboard: `I want to buy` from sellers, `I want to sell` to buyers.
 - **Auto trade detection** — when a trade completes in-game, the matching WFM whisper is automatically marked complete, the sold reply is copied to your clipboard, and the whisper stays visible as a ghost for 5 minutes.
-- **Auto listing update** — after a sale is detected, the corresponding WFM sell listing is automatically decremented (or deleted if the last copy). A Revert button appears on the ghost whisper to undo the change if needed.
+- **Auto listing update** — after a sale is detected, the corresponding WFM sell listing is automatically decremented (or deleted if the last copy). Works regardless of which tab is active. An **Auto-updated listings** changelog at the bottom of the Listings tab shows every automatic change with an Undo button per entry.
 - **Status auto-reconnect** — if WFM drops your status to offline, it is automatically restored without any action needed. Session token stored in Windows Credential Manager.
 - **Riven auction management** — view all active riven auctions with AUC/DIR badges, starting price, and buyout price. Edit price, visibility, and auction type (AUC↔DIR) via a dedicated popup. Type switching is handled server-side with a guaranteed full data fetch.
 - **In-app WFM login** — authenticate via a built-in WebView browser popup instead of entering credentials manually.

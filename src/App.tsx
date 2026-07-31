@@ -2706,9 +2706,11 @@ if (typeof s.autoDiagEnabled === "boolean") {
         )}
 
         {/* ── Market Helper module ── */}
-        {activeModule === "market" && (
+        {/* Keep mounted at all times so WfmTrading's trade-completed listener
+            (auto listing update) fires regardless of which tab is active. */}
+        <div style={{ display: activeModule === "market" ? "contents" : "none" }}>
           <MarketHelper inventory={inventory} refreshKey={itemsRefreshKey} crafting={crafting} onWfmLoginChange={handleWfmLoginChange} filters={marketFilters} onFiltersChange={setMarketFilters} modCopiesMap={modCopiesMap} />
-        )}
+        </div>
 
         {/* ── Relics module ── */}
         {activeModule === "relics" && (

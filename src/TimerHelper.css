@@ -117,7 +117,12 @@
 .st-cold   { color: #6eb6ff; background: rgba(110,182,255,.12); }
 .st-fass   { color: #ff6b4a; background: rgba(255,107,74,.12); }
 .st-vome   { color: #a8c8ff; background: rgba(168,200,255,.12); }
-.st-duviri { color: #c084fc; background: rgba(192,132,252,.12); }
+.st-duviri   { color: #c084fc; background: rgba(192,132,252,.12); }
+.st-joy      { color: #f0c040; background: rgba(240,192,64,.12); }
+.st-anger    { color: #f87171; background: rgba(248,113,113,.12); }
+.st-envy     { color: #4ade80; background: rgba(74,222,128,.12); }
+.st-sorrow   { color: #60a5fa; background: rgba(96,165,250,.12); }
+.st-fear     { color: #c084fc; background: rgba(192,132,252,.12); }
 .st-active { color: var(--green); background: rgba(63,185,80,.12); }
 .st-away   { color: var(--muted); background: rgba(255,255,255,.06); }
 .st-neutral { color: var(--muted); background: rgba(255,255,255,.06); }
@@ -841,4 +846,25 @@
   background: rgba(255,255,255,.08);
   color: var(--text);
   border-color: rgba(139,148,158,.5);
+}
+
+/* ── Duviri mood spiral ── */
+.duviri-spiral {
+  display: flex;
+  gap: 4px;
+  padding: 6px 10px 8px;
+  flex-wrap: wrap;
+}
+.duviri-mood-chip {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  opacity: .45;
+  white-space: nowrap;
+}
+.duviri-mood-chip.active {
+  opacity: 1;
+  border-color: currentColor;
 }
