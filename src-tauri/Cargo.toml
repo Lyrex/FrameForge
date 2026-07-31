@@ -1,6 +1,6 @@
 [package]
 name = "warframe-companion"
-version = "2.9.0+linux.2"
+version = "2.9.0-linux.3"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"

@@ -3,10 +3,14 @@ name: Release
 on:
   push:
     tags:
-      # `<upstream-version>+linux.<n>`, e.g. v2.7.0+linux.1. Semver build
-      # metadata, so it sorts equal to upstream's v2.7.0 rather than before it,
-      # which is what a `-linux.1` prerelease suffix would have done.
-      - 'v*\+linux.*'
+      # `<upstream-version>-linux.<n>`, e.g. v2.9.0-linux.3. Semver prerelease,
+      # not build metadata: `+linux.<n>` compares equal for every n (semver
+      # ignores build metadata), so an updater could never tell linux.2 from
+      # linux.3, and the `+` shows up URL-encoded in release asset links.
+      # Prerelease does sort before the bare upstream version, but this repo
+      # never publishes a bare-version artifact, so nothing compares against
+      # one.
+      - 'v*-linux.*'
 
 permissions:
   contents: write
