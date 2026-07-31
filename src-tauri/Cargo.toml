@@ -62,5 +62,10 @@ windows = { version = "0.58", features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 raw-window-handle = "0.6"
+# async-io rather than tokio: the blocking API is called from inside
+# spawn_blocking, and async-io drives its own executor instead of needing a
+# tokio reactor in scope. crypto-rust keeps libsecret and OpenSSL out of the
+# AppImage, which has already cost us one bundled-library bug.
+secret-service = { version = "5.1.0", default-features = false, features = ["rt-async-io-crypto-rust"] }
 tesseract = "0.15.2"
 xcb = "1.7"
