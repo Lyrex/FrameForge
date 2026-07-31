@@ -2006,7 +2006,9 @@ pub fn capture_all_blobs(
                 ts,
                 saved + 1
             ));
-            match std::fs::write(&path, raw) {
+            let json = extract_blob_json(raw)
+                .expect("parsing succeeded, so the blob bounds are known");
+            match std::fs::write(&path, &json) {
                 Ok(()) => saved += 1,
                 Err(error) => {
                     eprintln!("[blob-capture] Failed to write {}: {error}", path.display())
