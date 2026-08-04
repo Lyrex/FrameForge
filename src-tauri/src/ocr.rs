@@ -2054,25 +2054,42 @@ fn x11_window_title(conn: &xcb::Connection, window: xcb::x::Window) -> Option<St
 /// `_NET_CLIENT_LIST_STACKING` rather than by walking the whole window tree:
 /// that list holds exactly the client windows, so it cannot return a decoration
 /// frame or an unmapped helper window whose title happens to match.
+///
+/// Window tree traversal via QueryTree is used as a fallback for window managers
+/// and compositors (like Niri) that do not publish EWMH client lists.
 #[cfg(target_os = "linux")]
 fn warframe_window(conn: &xcb::Connection) -> Result<xcb::x::Window, String> {
-    let client_list = x11_atom(conn, "_NET_CLIENT_LIST_STACKING")?;
+    if let Ok(client_list) = x11_atom(conn, "_NET_CLIENT_LIST_STACKING") {
+        for screen in conn.get_setup().roots() {
+            let cookie = conn.send_request(&xcb::x::GetProperty {
+                delete: false,
+                window: screen.root(),
+                property: client_list,
+                r#type: xcb::x::ATOM_WINDOW,
+                long_offset: 0,
+                long_length: 1024,
+            });
+            let Ok(reply) = conn.wait_for_reply(cookie) else {
+                continue;
+            };
+            for &window in reply.value::<xcb::x::Window>() {
+                if x11_window_title(conn, window).as_deref() == Some(WARFRAME_WINDOW_TITLE) {
+                    return Ok(window);
+                }
+            }
+        }
+    }
 
+    // Fallback for Xwayland compositors (like Niri) that don't publish _NET_CLIENT_LIST:
     for screen in conn.get_setup().roots() {
-        let cookie = conn.send_request(&xcb::x::GetProperty {
-            delete: false,
+        let tree_cookie = conn.send_request(&xcb::x::QueryTree {
             window: screen.root(),
-            property: client_list,
-            r#type: xcb::x::ATOM_WINDOW,
-            long_offset: 0,
-            long_length: 1024,
         });
-        let Ok(reply) = conn.wait_for_reply(cookie) else {
-            continue;
-        };
-        for &window in reply.value::<xcb::x::Window>() {
-            if x11_window_title(conn, window).as_deref() == Some(WARFRAME_WINDOW_TITLE) {
-                return Ok(window);
+        if let Ok(reply) = conn.wait_for_reply(tree_cookie) {
+            for &window in reply.children().iter().rev() {
+                if x11_window_title(conn, window).as_deref() == Some(WARFRAME_WINDOW_TITLE) {
+                    return Ok(window);
+                }
             }
         }
     }
