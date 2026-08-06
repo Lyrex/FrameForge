@@ -94,11 +94,9 @@ impl LogParser {
     }
 }
 
-/// Where EE.log lives, whether or not Warframe has written it yet.
-///
-/// The log watchers start before the game does, so they need the path even
-/// when the file is still absent; callers that require an existing file use
-/// [`get_default_log_path`] instead.
+/// Where detection says EE.log lives, whether or not Warframe has written it
+/// yet. The player's `eeLogPath` override is not consulted; anything that
+/// actually watches the file must go through [`watched_log_path`] instead.
 pub fn default_log_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|data_dir| {
         #[cfg(target_os = "linux")]
@@ -112,10 +110,142 @@ pub fn default_log_path() -> Option<PathBuf> {
     })
 }
 
-pub fn get_default_log_path() -> Option<String> {
-    default_log_path()
-        .filter(|p| p.exists())
-        .map(|p| p.to_string_lossy().to_string())
+/// Resolved once at startup so the log watcher and the monitor always tail
+/// the same file; a changed `eeLogPath` override therefore needs a restart,
+/// which the settings UI says. Lives here rather than in `AppState` to keep
+/// the fork's footprint out of upstream's struct.
+static WATCHED_LOG_PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+pub fn init_watched_log_path(settings_path: &Path) {
+    let resolved = resolve_log_path(settings_path);
+    match &resolved {
+        Some(path) => eprintln!("EE.log resolved to {}", path.display()),
+        None => eprintln!("warning: no EE.log path could be resolved"),
+    }
+    let _ = WATCHED_LOG_PATH.set(resolved);
+}
+
+pub fn watched_log_path() -> Option<PathBuf> {
+    WATCHED_LOG_PATH
+        .get()
+        .cloned()
+        .unwrap_or_else(default_log_path)
+}
+
+pub fn resolve_log_path(settings_path: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        resolve_with_override(
+            log_path_override(settings_path).as_deref(),
+            dirs::data_local_dir(),
+        )
+    }
+    // Windows and macOS put the log in one fixed place, so there is nothing
+    // for an override to rescue.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = settings_path;
+        default_log_path()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn log_path_override(settings_path: &Path) -> Option<String> {
+    // A missing settings file just means first launch; a file that exists but
+    // does not parse means the player's override is about to be ignored, which
+    // is worth a trace.
+    let json = std::fs::read_to_string(settings_path).ok()?;
+    let settings: serde_json::Value = match serde_json::from_str(&json) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!(
+                "warning: {} is not valid JSON ({e}); ignoring any eeLogPath override",
+                settings_path.display()
+            );
+            return None;
+        }
+    };
+
+    settings
+        .get("eeLogPath")?
+        .as_str()
+        .map(|path| path.to_string())
+}
+
+#[derive(serde::Serialize)]
+pub struct EeLogStatus {
+    detected: Option<String>,
+    exists: bool,
+}
+
+/// Checks the path the player is looking at rather than the saved one, so a
+/// typo shows up before they restart on it.
+///
+/// `async` so the detection sweep's file I/O runs off the main thread.
+/// `is_file` rather than `exists`: a directory at the path would pass
+/// `exists()` while the watcher fails on it forever.
+#[tauri::command]
+pub async fn get_ee_log_status(path: Option<String>) -> EeLogStatus {
+    match effective_override(path.as_deref()) {
+        // With an override set, the detected path is hidden behind the typed
+        // text anyway, so the (filesystem-sweeping) detection can be skipped.
+        Some(entered) => EeLogStatus {
+            detected: None,
+            exists: entered.is_file(),
+        },
+        None => {
+            let detected = default_log_path();
+            EeLogStatus {
+                exists: detected.as_deref().is_some_and(|p| p.is_file()),
+                detected: detected.map(|p| p.to_string_lossy().to_string()),
+            }
+        }
+    }
+}
+
+/// The one definition of what counts as an override: the startup resolver and
+/// the settings-UI status check must agree on it, or the UI validates a
+/// different path than the watcher tails.
+pub fn effective_override(entered: Option<&str>) -> Option<PathBuf> {
+    entered
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(normalize_override)
+}
+
+/// The path as the player typed it, turned into the file to watch: `~` becomes
+/// the home directory, and a path naming the prefix's `Warframe` *directory*
+/// (the likeliest paste) gets `EE.log` appended.
+pub fn normalize_override(entered: &str) -> PathBuf {
+    normalize_override_in(entered, dirs::home_dir())
+}
+
+fn normalize_override_in(entered: &str, home: Option<PathBuf>) -> PathBuf {
+    let expanded = match entered.strip_prefix("~") {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => match home {
+            Some(home) => home.join(rest.trim_start_matches('/')),
+            None => PathBuf::from(entered),
+        },
+        _ => PathBuf::from(entered),
+    };
+
+    if expanded.is_dir() {
+        expanded.join("EE.log")
+    } else {
+        expanded
+    }
+}
+
+/// An override must win even when there is no data directory to search, so a
+/// missing `data_dir` only matters on the fallback path.
+#[cfg(target_os = "linux")]
+fn resolve_with_override(log_path: Option<&str>, data_dir: Option<PathBuf>) -> Option<PathBuf> {
+    match effective_override(log_path) {
+        // Deliberately not checked for existence: falling back to a guessed
+        // path would leave the player's setting looking ignored.
+        Some(path) => Some(path),
+        None => Some(linux_log_path(&data_dir?)),
+    }
 }
 
 // ==============================================================================
@@ -213,6 +343,25 @@ fn libraries_under(root: &Path) -> Vec<PathBuf> {
     libraries
 }
 
+/// Lutris names a prefix after the game as the player typed it, so no fixed
+/// name can be trusted; instead, every prefix under `~/Games` is a candidate.
+/// The listing is sorted so the pick is stable when several prefixes hold a
+/// log.
+#[cfg(target_os = "linux")]
+fn wine_prefix_roots(home: &Path) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = std::fs::read_dir(home.join("Games"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join("drive_c").is_dir())
+        .collect();
+    roots.sort();
+
+    roots.push(home.join(".wine"));
+    roots
+}
+
 /// Every path EE.log could occupy on this machine, best-guess first.
 #[cfg(target_os = "linux")]
 fn ee_log_candidates(data_dir: &Path, home: &Path, win_users: &[String]) -> Vec<Candidate> {
@@ -229,14 +378,16 @@ fn ee_log_candidates(data_dir: &Path, home: &Path, win_users: &[String]) -> Vec<
         }
     }
 
-    // A hand-made Wine prefix, for an install Steam knows nothing about. There
-    // is no compatdata directory to recognise it by, so it can only be found by
-    // the log already being there.
-    for win_user in win_users {
-        candidates.push(Candidate {
-            log: log_within_drive_c(&home.join(".wine/drive_c"), win_user),
-            prefix: None,
-        });
+    // Wine prefixes for an install Steam knows nothing about. None of them has
+    // a compatdata directory to recognise the install by, so they can only be
+    // found by the log already being there.
+    for prefix_root in wine_prefix_roots(home) {
+        for win_user in win_users {
+            candidates.push(Candidate {
+                log: log_within_drive_c(&prefix_root.join("drive_c"), win_user),
+                prefix: None,
+            });
+        }
     }
 
     // Roots overlap in the common case — the native root is listed in its own
@@ -343,15 +494,31 @@ mod linux_tests {
     use super::*;
     use std::fs;
 
-    /// A throwaway directory for one test's fake Steam layout.
+    /// A throwaway directory for one test's fake Steam layout; the drop guard
+    /// means a failing assertion cannot leak it.
     ///
     /// Cheaper than a `tempfile` dependency for the handful of tests here, and
     /// the name is unique per test because each call site passes its own tag.
-    fn scratch_dir(tag: &str) -> PathBuf {
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    fn scratch_dir(tag: &str) -> Scratch {
         let dir = std::env::temp_dir().join(format!("ff-eelog-{}-{}", std::process::id(), tag));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("temp dir is writable in a test environment");
-        dir
+        Scratch(dir)
     }
 
     /// Write a `libraryfolders.vdf` listing `libraries`, in Steam's own format.
@@ -443,8 +610,6 @@ mod linux_tests {
         let planted = plant_ee_log(&secondary);
 
         assert_eq!(search(&data_dir), planted);
-
-        let _ = fs::remove_dir_all(&scratch);
     }
 
     #[test]
@@ -467,8 +632,6 @@ mod linux_tests {
             search(&data_dir),
             ee_log_within(&secondary, PROTON_WIN_USER)
         );
-
-        let _ = fs::remove_dir_all(&scratch);
     }
 
     #[test]
@@ -489,8 +652,6 @@ mod linux_tests {
             search(&data_dir),
             ee_log_within(&data_dir.join("Steam"), PROTON_WIN_USER)
         );
-
-        let _ = fs::remove_dir_all(&scratch);
     }
 
     #[test]
@@ -504,8 +665,6 @@ mod linux_tests {
         let planted = plant_ee_log(&flatpak);
 
         assert_eq!(linux_log_path_in(&data_dir, &home, &stock_users()), planted);
-
-        let _ = fs::remove_dir_all(&scratch);
     }
 
     #[test]
@@ -517,8 +676,6 @@ mod linux_tests {
         let planted = plant_ee_log(&home.join(".steam/steam"));
 
         assert_eq!(linux_log_path_in(&data_dir, &home, &stock_users()), planted);
-
-        let _ = fs::remove_dir_all(&scratch);
     }
 
     #[test]
@@ -536,8 +693,6 @@ mod linux_tests {
         let planted = plant_ee_log(&secondary);
 
         assert_eq!(linux_log_path_in(&data_dir, &home, &stock_users()), planted);
-
-        let _ = fs::remove_dir_all(&scratch);
     }
 
     #[test]
@@ -552,8 +707,6 @@ mod linux_tests {
         let planted = plant(log_within_drive_c(&home.join(".wine/drive_c"), "player"));
 
         assert_eq!(linux_log_path_in(&data_dir, &home, &users), planted);
-
-        let _ = fs::remove_dir_all(&scratch);
     }
 
     #[test]
@@ -568,8 +721,6 @@ mod linux_tests {
         let planted = plant(ee_log_within(&data_dir.join("Steam"), "player"));
 
         assert_eq!(linux_log_path_in(&data_dir, &home, &users), planted);
-
-        let _ = fs::remove_dir_all(&scratch);
     }
 
     #[test]
@@ -581,6 +732,148 @@ mod linux_tests {
         assert_eq!(windows_users(None), vec!["steamuser"]);
         assert_eq!(windows_users(Some("")), vec!["steamuser"]);
         assert_eq!(windows_users(Some("steamuser")), vec!["steamuser"]);
+    }
+
+    #[test]
+    fn an_override_wins_whatever_the_search_would_say() {
+        for data_dir in [Some(PathBuf::from("/nonexistent")), None] {
+            assert_eq!(
+                resolve_with_override(Some("/mnt/games/wf/EE.log"), data_dir),
+                Some(PathBuf::from("/mnt/games/wf/EE.log"))
+            );
+        }
+    }
+
+    #[test]
+    fn no_override_falls_through_to_the_search() {
+        let scratch = scratch_dir("override-absent");
+        let data_dir = scratch.join("local-share");
+        let planted = plant_ee_log(&data_dir.join("Steam"));
+
+        for unset in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                resolve_with_override(unset, Some(data_dir.clone())),
+                Some(planted.clone()),
+                "{unset:?} should not count as an override"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_the_override_from_the_settings_file() {
+        let scratch = scratch_dir("settings");
+        let settings = scratch.join("settings.json");
+        fs::write(&settings, r#"{"overlayEnabled":true,"eeLogPath":"/mnt/wf/EE.log"}"#)
+            .expect("scratch dir is writable");
+
+        assert_eq!(
+            log_path_override(&settings),
+            Some("/mnt/wf/EE.log".to_string())
+        );
+
+        fs::write(&settings, r#"{"overlayEnabled":true}"#).expect("scratch dir is writable");
+        assert_eq!(log_path_override(&settings), None);
+        assert_eq!(log_path_override(&scratch.join("missing.json")), None);
+    }
+
+    #[test]
+    fn a_non_string_override_is_no_override() {
+        let scratch = scratch_dir("settings-nonstring");
+        let settings = scratch.join("settings.json");
+
+        for json in [r#"{"eeLogPath":null}"#, r#"{"eeLogPath":5}"#] {
+            fs::write(&settings, json).expect("scratch dir is writable");
+            assert_eq!(log_path_override(&settings), None, "{json}");
+        }
+    }
+
+    #[test]
+    fn resolve_log_path_returns_the_override_from_the_settings_file() {
+        let scratch = scratch_dir("resolve-end-to-end");
+        let settings = scratch.join("settings.json");
+        fs::write(&settings, r#"{"eeLogPath":"/mnt/wf/EE.log"}"#)
+            .expect("scratch dir is writable");
+
+        assert_eq!(
+            resolve_log_path(&settings),
+            Some(PathBuf::from("/mnt/wf/EE.log"))
+        );
+    }
+
+    #[test]
+    fn a_tilde_in_the_override_means_the_home_directory() {
+        assert_eq!(
+            normalize_override_in("~/wf/EE.log", Some(PathBuf::from("/home/player"))),
+            PathBuf::from("/home/player/wf/EE.log")
+        );
+
+        // No home to expand against: better the literal path (and its "no file
+        // there" warning) than a silently different one.
+        assert_eq!(
+            normalize_override_in("~/wf/EE.log", None),
+            PathBuf::from("~/wf/EE.log")
+        );
+
+        assert_eq!(
+            normalize_override_in("/mnt/~backup/EE.log", Some(PathBuf::from("/home/player"))),
+            PathBuf::from("/mnt/~backup/EE.log")
+        );
+    }
+
+    #[test]
+    fn an_override_naming_a_directory_means_the_log_inside_it() {
+        let scratch = scratch_dir("dir-override");
+        let dir = scratch.join("Warframe");
+        fs::create_dir_all(&dir).expect("scratch dir is writable");
+
+        assert_eq!(
+            normalize_override_in(dir.to_str().expect("scratch paths are UTF-8"), None),
+            dir.join("EE.log")
+        );
+    }
+
+    #[test]
+    fn finds_ee_log_in_a_lutris_prefix_however_the_player_named_it() {
+        let scratch = scratch_dir("lutris-renamed");
+        let data_dir = scratch.join("local-share");
+        let home = scratch.join("home");
+
+        let planted = plant(log_within_drive_c(
+            &home.join("Games/wf (proton-ge)/drive_c"),
+            PROTON_WIN_USER,
+        ));
+
+        assert_eq!(linux_log_path_in(&data_dir, &home, &stock_users()), planted);
+    }
+
+    #[test]
+    fn finds_a_lutris_prefix_named_after_the_linux_login() {
+        let scratch = scratch_dir("lutris-login");
+        let data_dir = scratch.join("local-share");
+        let home = scratch.join("home");
+
+        let users = vec![PROTON_WIN_USER.to_string(), "player".to_string()];
+        let planted = plant(log_within_drive_c(
+            &home.join("Games/warframe/drive_c"),
+            "player",
+        ));
+
+        assert_eq!(linux_log_path_in(&data_dir, &home, &users), planted);
+    }
+
+    #[test]
+    fn prefers_a_steam_install_over_a_leftover_lutris_prefix() {
+        let scratch = scratch_dir("lutris-vs-steam");
+        let data_dir = scratch.join("local-share");
+        let home = scratch.join("home");
+
+        let steam = plant_ee_log(&data_dir.join("Steam"));
+        plant(log_within_drive_c(
+            &home.join("Games/warframe/drive_c"),
+            PROTON_WIN_USER,
+        ));
+
+        assert_eq!(linux_log_path_in(&data_dir, &home, &stock_users()), steam);
     }
 
     #[test]
@@ -601,7 +894,5 @@ mod linux_tests {
         logs.dedup();
 
         assert_eq!(logs.len(), before, "candidate list repeats a path");
-
-        let _ = fs::remove_dir_all(&scratch);
     }
 }

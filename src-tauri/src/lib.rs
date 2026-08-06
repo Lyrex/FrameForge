@@ -3114,7 +3114,14 @@ fn wait_for_log_change(_notifier: Option<isize>, poll: std::time::Duration) {
 /// Called unconditionally at app startup — EE.log is plain file I/O, not memory reading.
 #[tauri::command]
 fn start_log_watcher(app: tauri::AppHandle) -> Result<(), String> {
-    let log_path = log_parser::default_log_path().ok_or("Cannot find the local data directory")?;
+    let log_path =
+        log_parser::watched_log_path().ok_or("Cannot find the local data directory")?;
+    if !log_path.is_file() {
+        eprintln!(
+            "warning: EE.log not found at {}; log-driven features stay idle until it appears",
+            log_path.display()
+        );
+    }
 
     std::thread::spawn(move || {
         use std::io::{Read, Seek, SeekFrom};
@@ -5207,7 +5214,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
     // Void Fissure reward selection screen becomes active.  All open-source
     // tools (WFInfo, warframeocr, Sentinel) use this string as their trigger.
     // We tail the log file instead of relying on fragile OCR gate heuristics.
-    let ee_log_path = log_parser::default_log_path();
+    let ee_log_path = log_parser::watched_log_path();
 
     // Shared flag: true while the reward screen is active according to EE.log
     let reward_screen_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -8606,6 +8613,7 @@ pub fn run() {
     let quantities_cache_path = data_dir.join("quantities_cache.json");
     let inventory_state_cache_path = data_dir.join("inventory_state_cache.json");
     let settings_path = data_dir.join("settings.json");
+    log_parser::init_watched_log_path(&settings_path);
     let log_path = data_dir.join("scan_log.txt");
     let changes_log_path = data_dir.join("inventory_changes.txt");
     let raw_scan_path = data_dir.join("raw_scan.txt");
@@ -8870,6 +8878,7 @@ pub fn run() {
             clear_cache,
             load_settings,
             save_settings,
+            log_parser::get_ee_log_status,
             read_scan_log,
             log_api_changes,
             dump_memory_probe,

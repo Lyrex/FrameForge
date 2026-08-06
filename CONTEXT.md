@@ -30,6 +30,14 @@ slug only exists for items warframe.market trades, and maps to a `unique_name`
 rather than replacing it.
 _Avoid_: url_name, item_url, market id
 
+### The game's log
+
+**Log path override**:
+The location of `EE.log` as chosen by the player, taking precedence over
+FrameForge's own detection. The game writes the log only once it has run, so an
+override naming a file that does not exist yet is a normal state, not an error.
+_Avoid_: custom log path, manual path (when the setting is meant)
+
 ### Trading
 
 **Trade**:
