@@ -2,7 +2,8 @@ import { useState, useEffect, useMemo, useCallback, memo, startTransition, useRe
 import { invoke } from "@tauri-apps/api/core";
 import { ImgCacheDirContext } from "./ImgCacheDir";
 import { HelpTip } from "./HelpTip";
-import type { InventoryItem } from "./App";
+import type { InventoryItem, ViewMode } from "./App";
+import { ViewToggle } from "./App";
 import sentientIcon from "./assets/SentientFactionIcon.webp";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -367,7 +368,7 @@ function RecipeModal({ item, recipe, inventory, isTracked, onTrack, onClose, cra
 
 // ─── Craft card ───────────────────────────────────────────────────────────────
 
-const CraftCard = memo(function CraftCard({ item, recipe, inventory, relicDrops, relicNames, crafting, isTracked, onTrack, onOpen, subsummedWarframes }: {
+const CraftCard = memo(function CraftCard({ item, recipe, inventory, relicDrops, relicNames, crafting, isTracked, onTrack, onOpen, subsummedWarframes, view }: {
   item: CatalogItem; recipe: RecipeComponent[] | null;
   inventory: Record<string, InventoryItem>; relicDrops: Record<string, string[]>;
   relicNames: Record<string, string>;
@@ -375,6 +376,7 @@ const CraftCard = memo(function CraftCard({ item, recipe, inventory, relicDrops,
   onTrack: (item: CatalogItem) => void;
   onOpen: (item: CatalogItem) => void;
   subsummedWarframes: Set<string>;
+  view: ViewMode;
 }) {
   const invEntry   = inventory[item.unique_name];
   const isOwned    = (invEntry?.quantity ?? 0) > 0;
@@ -394,6 +396,63 @@ const CraftCard = memo(function CraftCard({ item, recipe, inventory, relicDrops,
   const allParts = mergedRecipe && mergedRecipe.length > 0 && mergedRecipe.every(c =>
     (inventory[c.unique_name]?.quantity ?? 0) >= (c.count || 1)
   );
+
+  if (view === "icons") {
+    return (
+      <div className={`craft-icon-card${isOwned ? " craft-card-owned" : ""}${allParts && !isOwned ? " craft-card-ready" : ""}`}
+        title={`${item.name}${isOwned ? " (owned)" : allParts ? " (ready)" : ""}`}
+        onClick={() => onOpen(item)}>
+        <ItemImg imageName={item.image_name} category={item.category} size={72} />
+        {isOwned && <span className="craft-icon-badge craft-icon-badge-owned">✓✓</span>}
+        {!isOwned && allParts && <span className="craft-icon-badge craft-icon-badge-ready">⚡</span>}
+      </div>
+    );
+  }
+
+  if (view === "list" || view === "list-compact") {
+    return (
+      <div className={`craft-row${isOwned ? " craft-row-owned" : ""}${allParts && !isOwned ? " craft-row-ready" : ""}`}
+        onClick={() => onOpen(item)}>
+        {view === "list" && (
+          <div className="craft-row-icon">
+            <ItemImg imageName={item.image_name} category={item.category} size={24} />
+          </div>
+        )}
+        <div className="craft-row-name">{item.name}</div>
+        {item.mastery_req != null && item.mastery_req > 0 &&
+          <span className="craft-mr-req craft-row-mr">MR {item.mastery_req}</span>}
+        <div className="craft-row-status">
+          {isMastered && <span className="craft-icon-tag craft-icon-mastered" title="Mastered">★</span>}
+          {isOwned && !isMastered && <span className="craft-icon-tag craft-icon-owned">✓✓</span>}
+          {!isOwned && allParts && <span className="craft-icon-tag craft-icon-ready">⚡</span>}
+          {isCrafting && <span className="craft-icon-tag craft-icon-foundry" title="Building">⚒</span>}
+        </div>
+        {mergedRecipe && mergedRecipe.length > 0 &&
+          <span className="craft-row-parts">{mergedRecipe.length} part{mergedRecipe.length !== 1 ? "s" : ""}</span>}
+      </div>
+    );
+  }
+
+  if (view === "text-cards") {
+    return (
+      <div className={`craft-text-card${isOwned ? " craft-card-owned" : ""}${allParts && !isOwned ? " craft-card-ready" : ""}`}
+        onClick={() => onOpen(item)}>
+        <div className="ctc-name">{item.name}</div>
+        <div className="ctc-meta">
+          {item.vaulted === true  && <span className="vault-badge vault-yes">🔒 Vaulted</span>}
+          {item.vaulted === false && <span className="vault-badge vault-no">🔓 Unvaulted</span>}
+          {item.mastery_req != null && item.mastery_req > 0 &&
+            <span className="craft-mr-req">MR {item.mastery_req}</span>}
+        </div>
+        <div className="ctc-tags">
+          {isMastered && <span className="craft-icon-tag craft-icon-mastered" title="Mastered">★</span>}
+          {isOwned && !isMastered && <span className="craft-icon-tag craft-icon-owned">✓✓</span>}
+          {!isOwned && allParts && <span className="craft-icon-tag craft-icon-ready">⚡</span>}
+          {isCrafting && <span className="craft-icon-tag craft-icon-foundry" title="Building">⚒</span>}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -451,6 +510,7 @@ const CraftCard = memo(function CraftCard({ item, recipe, inventory, relicDrops,
 }, (prev, next) => {
   // Only re-render when props that affect this card's display actually change.
   // Avoids re-rendering all cards on every 10-second inventory scan.
+  if (prev.view          !== next.view)          return false;
   if (prev.item          !== next.item)          return false;
   if (prev.recipe        !== next.recipe)        return false;
   if (prev.isTracked     !== next.isTracked)     return false;
@@ -491,6 +551,9 @@ export default function Foundry({ inventory, refreshKey, crafting, subsummedWarf
   const [modalItem, setModalItem] = useState<CatalogItem | null>(null);
   const [inputSearch, setInputSearch] = useState(filters.search);
   const [page, setPage] = useState(0);
+  const [craftView, setCraftView] = useState<ViewMode>(() =>
+    (localStorage.getItem("ff-view-foundry") as ViewMode | null) ?? "cards"
+  );
 
   // Refs so debounce closure always reads latest values without stale captures
   const filtersRef = useRef(filters);
@@ -675,6 +738,7 @@ export default function Foundry({ inventory, refreshKey, crafting, subsummedWarf
           <button className={`fchip ${filterUnmastered? "fchip-on" : ""}`} onClick={() => set("filterUnmastered", !filterUnmastered)}>☆ Unmastered</button>
           {isFiltered && <button className="fchip fchip-reset" onClick={() => onFiltersChange({ ...FOUNDRY_FILTERS_DEFAULT, activeCat })}>Show All</button>}
           <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--muted)" }}>{visible.length} items</span>
+          <ViewToggle view={craftView} onChange={v => { setCraftView(v); localStorage.setItem("ff-view-foundry", v); }} />
           <HelpTip items={[
             { swatch: "rgba(240,192,64,.5)", icon: "✓✓", label: "Owned",          desc: "Gold border + ✓✓ — item built and in inventory" },
             { swatch: "rgba(56,139,253,.5)", icon: "⚡",  label: "Ready to craft", desc: "Blue border + ⚡ — all parts collected" },
@@ -686,7 +750,7 @@ export default function Foundry({ inventory, refreshKey, crafting, subsummedWarf
           ]} />
         </div>
 
-        <div className="craft-grid">
+        <div className={`craft-grid craft-grid-${craftView}`}>
           {visible.length === 0 && (
             <div className="empty-msg">
               {craftable.length === 0 ? "No recipes loaded — refresh item list first." : "No items match."}
@@ -705,6 +769,7 @@ export default function Foundry({ inventory, refreshKey, crafting, subsummedWarf
               onTrack={handleTrack}
               onOpen={handleOpen}
               subsummedWarframes={subsummedWarframes}
+              view={craftView}
             />
           ))}
         </div>

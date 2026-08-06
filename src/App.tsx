@@ -388,6 +388,82 @@ function ModularWindowPage() {
 }
 
 
+// ─── View mode ───────────────────────────────────────────────────────────────
+
+export type ViewMode = "cards" | "icons" | "text-cards" | "list" | "list-compact";
+
+const VIEW_LABELS: Record<ViewMode, string> = {
+  "cards":        "Cards (icon + text)",
+  "icons":        "Icon grid",
+  "text-cards":   "Text cards (no icons)",
+  "list":         "List with icon",
+  "list-compact": "Compact list (text only)",
+};
+
+function ViewIcon({ mode }: { mode: ViewMode }) {
+  switch (mode) {
+    case "cards": return (
+      <svg width="16" height="13" viewBox="0 0 16 13" fill="currentColor">
+        <rect x="0" y="0" width="3" height="3" rx="0.5"/><rect x="4" y="0.5" width="3.5" height="1.5" rx="0.4"/>
+        <rect x="9" y="0" width="3" height="3" rx="0.5"/><rect x="13" y="0.5" width="3" height="1.5" rx="0.4"/>
+        <rect x="0" y="5" width="3" height="3" rx="0.5"/><rect x="4" y="5.5" width="3.5" height="1.5" rx="0.4"/>
+        <rect x="9" y="5" width="3" height="3" rx="0.5"/><rect x="13" y="5.5" width="3" height="1.5" rx="0.4"/>
+        <rect x="0" y="10" width="3" height="3" rx="0.5"/><rect x="4" y="10.5" width="3.5" height="1.5" rx="0.4"/>
+        <rect x="9" y="10" width="3" height="3" rx="0.5"/><rect x="13" y="10.5" width="3" height="1.5" rx="0.4"/>
+      </svg>
+    );
+    case "icons": return (
+      <svg width="16" height="13" viewBox="0 0 16 13" fill="currentColor">
+        <rect x="0" y="0" width="4" height="4" rx="0.5"/><rect x="6" y="0" width="4" height="4" rx="0.5"/><rect x="12" y="0" width="4" height="4" rx="0.5"/>
+        <rect x="0" y="5" width="4" height="4" rx="0.5"/><rect x="6" y="5" width="4" height="4" rx="0.5"/><rect x="12" y="5" width="4" height="4" rx="0.5"/>
+        <rect x="0" y="10" width="4" height="4" rx="0.5"/><rect x="6" y="10" width="4" height="4" rx="0.5"/><rect x="12" y="10" width="4" height="4" rx="0.5"/>
+      </svg>
+    );
+    case "text-cards": return (
+      <svg width="16" height="13" viewBox="0 0 16 13" fill="currentColor">
+        <rect x="0" y="0" width="7" height="1.5" rx="0.4"/><rect x="0" y="2.5" width="5" height="1" rx="0.4"/>
+        <rect x="9" y="0" width="7" height="1.5" rx="0.4"/><rect x="9" y="2.5" width="5" height="1" rx="0.4"/>
+        <rect x="0" y="5" width="7" height="1.5" rx="0.4"/><rect x="0" y="7.5" width="5" height="1" rx="0.4"/>
+        <rect x="9" y="5" width="7" height="1.5" rx="0.4"/><rect x="9" y="7.5" width="5" height="1" rx="0.4"/>
+        <rect x="0" y="10" width="7" height="1.5" rx="0.4"/><rect x="0" y="12" width="5" height="1" rx="0.4"/>
+        <rect x="9" y="10" width="7" height="1.5" rx="0.4"/><rect x="9" y="12" width="5" height="1" rx="0.4"/>
+      </svg>
+    );
+    case "list": return (
+      <svg width="16" height="13" viewBox="0 0 16 13" fill="currentColor">
+        <rect x="0" y="0" width="2.5" height="2.5" rx="0.4"/><rect x="4" y="0.5" width="12" height="1.5" rx="0.4"/>
+        <rect x="0" y="3.5" width="2.5" height="2.5" rx="0.4"/><rect x="4" y="4" width="12" height="1.5" rx="0.4"/>
+        <rect x="0" y="7" width="2.5" height="2.5" rx="0.4"/><rect x="4" y="7.5" width="12" height="1.5" rx="0.4"/>
+        <rect x="0" y="10.5" width="2.5" height="2.5" rx="0.4"/><rect x="4" y="11" width="12" height="1.5" rx="0.4"/>
+      </svg>
+    );
+    case "list-compact": return (
+      <svg width="16" height="13" viewBox="0 0 16 13" fill="currentColor">
+        <rect x="0" y="0" width="16" height="1.5" rx="0.4"/>
+        <rect x="0" y="2.5" width="11" height="1.5" rx="0.4"/>
+        <rect x="0" y="5" width="16" height="1.5" rx="0.4"/>
+        <rect x="0" y="7.5" width="13" height="1.5" rx="0.4"/>
+        <rect x="0" y="10" width="16" height="1.5" rx="0.4"/>
+        <rect x="0" y="12" width="10" height="1" rx="0.4"/>
+      </svg>
+    );
+  }
+}
+
+export function ViewToggle({ view, onChange }: { view: ViewMode; onChange: (v: ViewMode) => void }) {
+  const modes: ViewMode[] = ["cards", "icons", "text-cards", "list", "list-compact"];
+  return (
+    <div className="view-toggle">
+      {modes.map(m => (
+        <button key={m} className={`view-btn${view === m ? " view-btn-active" : ""}`}
+          title={VIEW_LABELS[m]} onClick={() => onChange(m)}>
+          <ViewIcon mode={m} />
+        </button>
+      ))}
+    </div>
+  );
+}
+
 // ─── Memoized inventory card components ──────────────────────────────────────
 
 interface InvModCardProps {
@@ -397,13 +473,33 @@ interface InvModCardProps {
   image_name?: string | null;
   ranks: { rank: number; count: number }[];
   total: number;
+  view: ViewMode;
 }
-const InvModCard = memo(function InvModCard({ unique_name, name, category, image_name, ranks, total }: InvModCardProps) {
+const InvModCard = memo(function InvModCard({ unique_name, name, category, image_name, ranks, total, view }: InvModCardProps) {
+  if (view === "icons") {
+    return (
+      <div key={unique_name} className="inv-card inv-card-icon-only" title={`${name} ×${fmt(total)}`}>
+        <ItemImg imageName={image_name ?? undefined} category={category} size={52} />
+      </div>
+    );
+  }
+  if (view === "list" || view === "list-compact") {
+    return (
+      <div key={unique_name} className="inv-card inv-card-row">
+        {view === "list" && <div className="inv-row-icon"><ItemImg imageName={image_name ?? undefined} category={category} size={20} /></div>}
+        <div className="inv-row-name">{name}</div>
+        <div className="inv-row-cat">{category}</div>
+        <div className="inv-row-qty">{fmt(total)}</div>
+      </div>
+    );
+  }
   return (
     <div key={unique_name} className="inv-card inv-card-mod">
-      <div className="inv-card-img-wrap">
-        <ItemImg imageName={image_name ?? undefined} category={category} size={40} />
-      </div>
+      {view !== "text-cards" && (
+        <div className="inv-card-img-wrap">
+          <ItemImg imageName={image_name ?? undefined} category={category} size={40} />
+        </div>
+      )}
       <div className="inv-card-name">{name}</div>
       <div className="inv-card-cat">{category}</div>
       <div className="mod-rank-table">
@@ -418,6 +514,7 @@ const InvModCard = memo(function InvModCard({ unique_name, name, category, image
     </div>
   );
 }, (prev, next) =>
+  prev.view === next.view &&
   prev.unique_name === next.unique_name &&
   prev.name === next.name &&
   prev.total === next.total &&
@@ -438,10 +535,11 @@ interface InvCardProps {
   craftJobName: string | null;
   masteryRank: number | undefined;
   onToggleFavorite: (id: string) => void;
+  view: ViewMode;
 }
 const InvCard = memo(function InvCard({
   unique_name, name, category, image_name, qty,
-  isFavorite, changedAt, recentDelta, craftJobName, masteryRank, onToggleFavorite,
+  isFavorite, changedAt, recentDelta, craftJobName, masteryRank, onToggleFavorite, view,
 }: InvCardProps) {
   const nowSec = Date.now() / 1000;
   const secAgo = changedAt != null ? nowSec - changedAt : null;
@@ -449,9 +547,44 @@ const InvCard = memo(function InvCard({
   const isZero = qty === 0 && !craftJobName;
   const isMastered = masteryRank != null && masteryRank >= 30;
   const showRank = masteryRank != null && masteryRank > 0;
+  const recentLabel = secAgo !== null ? (Math.floor(secAgo / 60) === 0 ? "· now" : `· ${Math.floor(secAgo / 60)}m`) : null;
+  const baseClass = `inv-card${isZero ? " inv-card-zero" : ""}${isRecent ? (recentDelta != null && recentDelta > 0 ? " inv-card-gained" : " inv-card-lost") : ""}`;
+
+  if (view === "icons") {
+    return (
+      <div className={`${baseClass} inv-card-icon-only`} title={`${name} (${fmt(qty)})`}>
+        <ItemImg imageName={image_name ?? undefined} category={category} size={52} />
+      </div>
+    );
+  }
+  if (view === "list" || view === "list-compact") {
+    return (
+      <div className={`${baseClass} inv-card-row`}>
+        <button className={`inv-fav-star-row ${isFavorite ? "active" : ""}`}
+          title={isFavorite ? "Remove from Modular Window" : "Add to Modular Window"}
+          onClick={e => { e.stopPropagation(); onToggleFavorite(unique_name); }}>
+          {isFavorite ? "★" : "☆"}
+        </button>
+        {view === "list" && (
+          <div className="inv-row-icon">
+            <ItemImg imageName={image_name ?? undefined} category={category} size={20} />
+            {craftJobName && <span className="inv-foundry-icon-row" title={`Building — ${craftJobName}`}>⚒</span>}
+          </div>
+        )}
+        <div className="inv-row-name">
+          {name}
+          {isRecent && <span className="item-updated">{recentLabel}</span>}
+        </div>
+        <div className="inv-row-cat">{category}</div>
+        <div className="inv-row-qty">
+          {fmt(qty)}
+          {isRecent && recentDelta != null && <span className={`item-delta ${deltaClass(recentDelta)}`}>{deltaText(recentDelta)}</span>}
+        </div>
+      </div>
+    );
+  }
   return (
-    <div
-      className={`inv-card ${isZero ? "inv-card-zero" : ""} ${isRecent ? (recentDelta != null && recentDelta > 0 ? "inv-card-gained" : "inv-card-lost") : ""}`}>
+    <div className={baseClass}>
       <button
         className={`inv-fav-star ${isFavorite ? "active" : ""}`}
         title={isFavorite ? "Remove from Modular Window" : "Add to Modular Window"}
@@ -464,15 +597,15 @@ const InvCard = memo(function InvCard({
             ? <span className="inv-mastery-rank" title={`Rank ${masteryRank}`}>R{masteryRank}</span>
             : null}
       </div>
-      <div className="inv-card-img-wrap">
-        <ItemImg imageName={image_name ?? undefined} category={category} size={48} />
-        {craftJobName && <span className="inv-foundry-icon" title={`Building — ${craftJobName}`}>⚒</span>}
-      </div>
+      {view !== "text-cards" && (
+        <div className="inv-card-img-wrap">
+          <ItemImg imageName={image_name ?? undefined} category={category} size={48} />
+          {craftJobName && <span className="inv-foundry-icon" title={`Building — ${craftJobName}`}>⚒</span>}
+        </div>
+      )}
       <div className="inv-card-name">
         {name}
-        {isRecent && secAgo !== null && (
-          <span className="item-updated">{Math.floor(secAgo / 60) === 0 ? "· now" : `· ${Math.floor(secAgo / 60)}m`}</span>
-        )}
+        {isRecent && <span className="item-updated">{recentLabel}</span>}
       </div>
       <div className="inv-card-cat">{category}</div>
       <div className={`inv-card-qty ${isZero ? "inv-card-qty-zero" : ""}`}>
@@ -484,6 +617,7 @@ const InvCard = memo(function InvCard({
     </div>
   );
 }, (prev, next) => {
+  if (prev.view !== next.view) return false;
   if (
     prev.unique_name !== next.unique_name ||
     prev.qty !== next.qty ||
@@ -600,6 +734,9 @@ const [blobLogEnabled, setBlobLogEnabled] = useState(false);
   const [filterUnvaulted,setFilterUnvaulted]= useState(false);
   const [sortMode, setSortMode] = useState<"qty-desc" | "qty-asc" | "name-asc" | "name-desc" | "recent">("qty-desc");
   const [filterRank, setFilterRank] = useState<number | "unranked" | null>(null);
+  const [inventoryView, setInventoryView] = useState<ViewMode>(() =>
+    (localStorage.getItem("ff-view-inventory") as ViewMode | null) ?? "cards"
+  );
 
   // ── Per-tab persisted filter state ────────────────────────────────────────
   const [foundryFilters, setFoundryFilters] = useState({
@@ -2202,7 +2339,7 @@ if (typeof s.autoDiagEnabled === "boolean") {
                         <span className="settings-row-label">Text Size</span>
                         <span className="settings-row-desc">{Math.round(textScale * 100)}%</span>
                       </div>
-                      <input type="range" min="0.8" max="1.4" step="0.05" value={textScale}
+                      <input type="range" min="0.8" max="2.0" step="0.1" value={textScale}
                         style={{ width: 120 }}
                         onChange={e => {
                           const v = parseFloat(e.target.value);
@@ -2579,6 +2716,7 @@ if (typeof s.autoDiagEnabled === "boolean") {
                 <button className={`fchip ${sortMode==="name-asc"?"fchip-on":""}`} onClick={()=>setSortMode("name-asc")}>A-Z</button>
                 <button className={`fchip ${sortMode==="name-desc"?"fchip-on":""}`} onClick={()=>setSortMode("name-desc")}>Z-A</button>
                 <span className="item-count-label" style={{marginLeft:"auto"}}>{visibleItems.length} item{visibleItems.length!==1?"s":""}{visibleItems.length===1000?" (capped)":""}</span>
+                <ViewToggle view={inventoryView} onChange={v => { setInventoryView(v); localStorage.setItem("ff-view-inventory", v); }} />
                 <HelpTip items={[
                   { icon: "★",  label: "★  Mastered",  desc: "Shown above image — item levelled to rank 30" },
                   { icon: "R5", label: "R{n}  Rank",   desc: "Shown above image — current rank, not yet mastered" },
@@ -2588,7 +2726,7 @@ if (typeof s.autoDiagEnabled === "boolean") {
                 ]} />
               </div>
 
-              <div className="item-grid">
+              <div className={`item-grid item-grid-${inventoryView}`}>
                 {visibleItems.length === 0 ? (
                   <div className="empty-msg" style={{gridColumn:"1/-1"}}>
                     {monitoring
@@ -2613,7 +2751,7 @@ if (typeof s.autoDiagEnabled === "boolean") {
                         <InvModCard key={item.unique_name}
                           unique_name={item.unique_name} name={item.name}
                           category={item.category} image_name={item.image_name}
-                          ranks={ranks} total={total} />
+                          ranks={ranks} total={total} view={inventoryView} />
                       )];
                     }
 
@@ -2631,7 +2769,8 @@ if (typeof s.autoDiagEnabled === "boolean") {
                         recentDelta={recentChange?.delta ?? null}
                         craftJobName={craftJob?.item_name ?? null}
                         masteryRank={inventory[item.unique_name]?.mastery_rank}
-                        onToggleFavorite={toggleFavorite} />
+                        onToggleFavorite={toggleFavorite}
+                        view={inventoryView} />
                     )];
                   })
                 )}

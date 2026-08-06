@@ -1,7 +1,8 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { HelpTip } from "./HelpTip";
-import type { InventoryItem } from "./App";
+import type { InventoryItem, ViewMode } from "./App";
+import { ViewToggle } from "./App";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -194,7 +195,7 @@ function RewardBox({ reward, imageSrcs, isOwned, isComplete, isHighlighted, colo
 const REFINEMENT_SUFFIXES_CARD = ["intact", "exceptional", "flawless", "radiant"];
 const REFINEMENT_LABELS_CARD   = ["Intact", "Except.", "Flawless", "Radiant"];
 
-function RelicCard({ drop, catalogRelicByName, inventory, ownedPrimeNames, searchQ, nameMap, colorblindMode }: {
+function RelicCard({ drop, catalogRelicByName, inventory, ownedPrimeNames, searchQ, nameMap, colorblindMode, view }: {
   drop: RelicDrop;
   catalogRelicByName: Map<string, CatalogItem>;
   inventory: Record<string, InventoryItem>;
@@ -202,6 +203,7 @@ function RelicCard({ drop, catalogRelicByName, inventory, ownedPrimeNames, searc
   searchQ: string;
   nameMap: Map<string, CatalogItem>;
   colorblindMode: boolean;
+  view: ViewMode;
 }) {
   const baseLower = drop.fullName.toLowerCase();
 
@@ -267,8 +269,61 @@ function RelicCard({ drop, catalogRelicByName, inventory, ownedPrimeNames, searc
     ...Array<null>(Math.max(0, 6 - drop.rewards.length)).fill(null),
   ];
 
+  const cardClass = `relic-card${total === 0 ? " relic-card-unowned" : allComplete ? " relic-card-complete" : ""}`;
+
+  if (view === "icons") {
+    return (
+      <div className={`${cardClass} relic-card-icon-only`} title={`${drop.fullName} ×${total}`}>
+        <RelicImg src={CDN(intactCat?.image_name)} />
+        <span className="relic-icon-count">×{total}</span>
+      </div>
+    );
+  }
+
+  if (view === "list" || view === "list-compact") {
+    const refCompact = refCounts.filter(r => r.count > 0)
+      .map(r => `${r.label[0].toUpperCase()}:${r.count}`)
+      .join(" ");
+    return (
+      <div className={`${cardClass} relic-card-row`}>
+        {view === "list" && <div className="relic-row-img"><RelicImg src={CDN(intactCat?.image_name)} /></div>}
+        <div className="relic-row-name">{drop.fullName}</div>
+        {intactCat?.vaulted && <span className="vault-badge vault-yes" style={{ fontSize: 9 }}>🔒</span>}
+        <span className="relic-row-total">×{total}</span>
+        {refCompact && <span className="relic-row-refs">{refCompact}</span>}
+      </div>
+    );
+  }
+
+  if (view === "text-cards") {
+    return (
+      <div className={`${cardClass} relic-text-card`}>
+        <div className="relic-card-left">
+          <div className="relic-card-name">{drop.fullName}</div>
+          {intactCat?.vaulted && <span className="vault-badge vault-yes">🔒 Vaulted</span>}
+          <div className="relic-refinements">
+            {refCounts.some(r => r.count > 0)
+              ? refCounts.map(r => (
+                <span key={r.label} className={`relic-ref ${r.count > 0 ? "relic-ref-owned" : "relic-ref-zero"}`}>
+                  {r.count} {r.label}
+                </span>
+              ))
+              : <span className="relic-ref relic-ref-owned">Total: {total}</span>}
+          </div>
+        </div>
+        <div className="relic-text-rewards">
+          {drop.rewards.map((r, i) => (
+            <div key={i} className={`relic-text-reward relic-rarity-${r.rarity?.toLowerCase() ?? "common"}`}>
+              {r.itemName}
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className={`relic-card${total === 0 ? " relic-card-unowned" : allComplete ? " relic-card-complete" : ""}`}>
+    <div className={cardClass}>
       <div className="relic-card-left">
         <div className="relic-card-icon-row">
           <RelicImg src={CDN(intactCat?.image_name)} />
@@ -348,9 +403,297 @@ function RelicCard({ drop, catalogRelicByName, inventory, ownedPrimeNames, searc
   );
 }
 
+// ─── Planner ─────────────────────────────────────────────────────────────────
+
+const DROP_RATES = {
+  intact:      { Common: 0.2533, Uncommon: 0.11,  Rare: 0.02 },
+  exceptional: { Common: 0.2333, Uncommon: 0.13,  Rare: 0.04 },
+  flawless:    { Common: 0.20,   Uncommon: 0.17,  Rare: 0.06 },
+  radiant:     { Common: 0.1667, Uncommon: 0.20,  Rare: 0.10 },
+} as const;
+
+type PlannerTier = keyof typeof DROP_RATES;
+const PLANNER_TIERS: PlannerTier[] = ["intact", "exceptional", "flawless", "radiant"];
+const TIER_LABEL: Record<PlannerTier, string> = {
+  intact: "Intact", exceptional: "Except.", flawless: "Flawless", radiant: "Radiant",
+};
+
+function wfmNorm(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+}
+
+function computeEV(
+  rewards: DropReward[],
+  tier: PlannerTier,
+  vals: number[],
+  squadSize: number,
+): number {
+  const rates = DROP_RATES[tier];
+  const probs = rewards.map(r => rates[r.rarity as keyof typeof rates] ?? 0);
+  const n = rewards.length;
+  if (n === 0) return 0;
+
+  if (squadSize === 1) {
+    return rewards.reduce((s, r, i) => s + (rates[r.rarity as keyof typeof rates] ?? 0) * vals[i], 0);
+  }
+
+  // For N>1: iterate all n^N draw combinations, weight by probability, take max value.
+  // n=6, N≤4 → at most 1296 combinations — runs in <1ms.
+  let ev = 0;
+  const iterate = (player: number, prob: number, maxVal: number) => {
+    if (player === squadSize) { ev += prob * maxVal; return; }
+    for (let i = 0; i < n; i++) iterate(player + 1, prob * probs[i], Math.max(maxVal, vals[i]));
+  };
+  iterate(0, 1.0, 0);
+  return ev;
+}
+
+function PlannerTab({
+  drops, nameMap, catalogRelicByName, inventory,
+}: {
+  drops: RelicDrop[];
+  nameMap: Map<string, CatalogItem>;
+  catalogRelicByName: Map<string, CatalogItem>;
+  inventory: Record<string, InventoryItem>;
+}) {
+  const [metric, setMetric]         = useState<"plat" | "ducat">("plat");
+  const [squadSize, setSquadSize]   = useState<1 | 2 | 3 | 4>(1);
+  const [ownedOnly, setOwnedOnly]   = useState(true);
+  const [vaultFilter, setVaultFilter] = useState<"all" | "vaulted" | "unvaulted">("all");
+  const [tierFilter, setTierFilter] = useState<string[]>([]);
+  const [expanded, setExpanded]     = useState<string | null>(null);
+  const [sortCol, setSortCol]       = useState<"name" | "owned" | PlannerTier | "gain">("radiant");
+  const [sortDir, setSortDir]       = useState<"desc" | "asc">("desc");
+  // WFM url_name → price map (keyed by url_name slug)
+  const [platPrices, setPlatPrices] = useState<Map<string, number>>(new Map());
+
+  // Load WFM items to build name→slug lookup, then fetch cached prices
+  useEffect(() => {
+    invoke<{ item_name: string; url_name: string }[]>("fetch_wfm_items")
+      .then(items => {
+        const lookup = new Map<string, string>();
+        for (const w of items) lookup.set(wfmNorm(w.item_name), w.url_name);
+        return lookup;
+      })
+      .then(lookup => {
+        invoke<Record<string, number | null>>("wfm_get_cached_prices")
+          .then(raw => {
+            const m = new Map<string, number>();
+            for (const [slug, price] of Object.entries(raw)) {
+              if (price != null) m.set(slug, price);
+            }
+            // Also index by normalized item name for direct lookup
+            for (const [norm, slug] of lookup) {
+              const p = m.get(slug);
+              if (p != null) m.set(norm, p);
+            }
+            setPlatPrices(m);
+          })
+          .catch(() => {});
+      })
+      .catch(() => {});
+  }, []);
+
+  const REFINEMENT_SUFFIXES = ["intact", "exceptional", "flawless", "radiant"];
+
+  const getOwnedByTier = useCallback((drop: RelicDrop) => {
+    const base = drop.fullName.toLowerCase();
+    return REFINEMENT_SUFFIXES.reduce<Record<string, number>>((acc, ref) => {
+      const cat = catalogRelicByName.get(`${base} ${ref}`);
+      acc[ref] = cat ? (inventory[cat.unique_name]?.quantity ?? 0) : 0;
+      return acc;
+    }, {});
+  }, [catalogRelicByName, inventory]);
+
+  const getTotal = useCallback((drop: RelicDrop) => {
+    const tiers = getOwnedByTier(drop);
+    return Object.values(tiers).reduce((s, n) => s + n, 0);
+  }, [getOwnedByTier]);
+
+  // Precompute per-relic EV at all tiers
+  const plannerRows = useMemo(() => {
+    return drops
+      .filter(d => {
+        if (!d.relicName) return false;
+        if (ownedOnly && getTotal(d) === 0) return false;
+        if (tierFilter.length > 0 && !tierFilter.includes(d.tier.toLowerCase())) return false;
+        if (vaultFilter !== "all") {
+          const cat = catalogRelicByName.get(`${d.fullName.toLowerCase()} intact`);
+          if (vaultFilter === "vaulted" && cat?.vaulted !== true) return false;
+          if (vaultFilter === "unvaulted" && cat?.vaulted === true) return false;
+        }
+        return true;
+      })
+      .map(drop => {
+        const rewards = drop.rewards.filter(r => r?.itemName);
+        const vals = rewards.map(r => {
+          if (metric === "ducat") {
+            const cat = findCatalogItemGlobal(r.itemName, nameMap);
+            return cat?.ducats ?? 0;
+          }
+          // plat: lookup by slug or normalized name
+          const slug = platPrices.get(wfmNorm(r.itemName));
+          if (slug != null) return slug;
+          return platPrices.get(wfmNorm(r.itemName)) ?? 0;
+        });
+
+        const evByTier = Object.fromEntries(
+          PLANNER_TIERS.map(t => [t, computeEV(rewards, t, vals, squadSize)])
+        ) as Record<PlannerTier, number>;
+
+        const bestTier = PLANNER_TIERS.reduce((best, t) =>
+          evByTier[t] > evByTier[best] ? t : best, "intact" as PlannerTier);
+
+        const ownedByTier = getOwnedByTier(drop);
+        const totalOwned  = Object.values(ownedByTier).reduce((s, n) => s + n, 0);
+        const vaulted     = catalogRelicByName.get(`${drop.fullName.toLowerCase()} intact`)?.vaulted === true;
+
+        return { drop, rewards, vals, evByTier, bestTier, ownedByTier, totalOwned, vaulted };
+      })
+      .sort((a, b) => {
+        let delta = 0;
+        if (sortCol === "name")  delta = a.drop.fullName.localeCompare(b.drop.fullName);
+        else if (sortCol === "owned") delta = a.totalOwned - b.totalOwned;
+        else if (sortCol === "gain")  delta = (a.evByTier.radiant - a.evByTier.intact) - (b.evByTier.radiant - b.evByTier.intact);
+        else delta = a.evByTier[sortCol] - b.evByTier[sortCol];
+        return sortDir === "desc" ? -delta : delta;
+      });
+  }, [drops, metric, squadSize, ownedOnly, tierFilter, vaultFilter, sortCol, sortDir, platPrices, nameMap, catalogRelicByName, inventory, getOwnedByTier, getTotal]);
+
+  const unit = metric === "plat" ? "p" : " dc";
+
+  function handleSort(col: typeof sortCol) {
+    if (col === sortCol) setSortDir(d => d === "desc" ? "asc" : "desc");
+    else { setSortCol(col); setSortDir(col === "name" ? "asc" : "desc"); }
+  }
+  function sortArrow(col: typeof sortCol) {
+    return (
+      <span className="planner-sort-arrow" style={{ visibility: col === sortCol ? "visible" : "hidden" }}>
+        {sortDir === "desc" ? "▼" : "▲"}
+      </span>
+    );
+  }
+
+  return (
+    <div className="planner-wrap">
+      {/* Controls */}
+      <div className="planner-controls">
+        <div className="planner-control-group">
+          <span className="planner-label">Metric</span>
+          <button className={`fchip${metric === "plat"  ? " fchip-on" : ""}`} onClick={() => setMetric("plat")}>Platinum</button>
+          <button className={`fchip${metric === "ducat" ? " fchip-on" : ""}`} onClick={() => setMetric("ducat")}>Ducats</button>
+        </div>
+        <div className="planner-control-group">
+          <span className="planner-label">Squad</span>
+          {([1, 2, 3, 4] as const).map(n => (
+            <button key={n} className={`fchip${squadSize === n ? " fchip-on" : ""}`} onClick={() => setSquadSize(n)}>
+              {n === 1 ? "Solo" : `${n}p`}
+            </button>
+          ))}
+        </div>
+        <div className="planner-control-group">
+          <span className="planner-label">Era</span>
+          {(["lith","meso","neo","axi"] as const).map(t => (
+            <button key={t} className={`fchip${tierFilter.includes(t) ? " fchip-on" : ""}`}
+              onClick={() => setTierFilter(prev => prev.includes(t) ? prev.filter(x => x !== t) : [...prev, t])}>
+              {t[0].toUpperCase() + t.slice(1)}
+            </button>
+          ))}
+        </div>
+        <div className="planner-control-group">
+          <button className={`fchip${vaultFilter === "unvaulted" ? " fchip-on" : ""}`} onClick={() => setVaultFilter(v => v === "unvaulted" ? "all" : "unvaulted")}>Unvaulted</button>
+          <button className={`fchip${vaultFilter === "vaulted"   ? " fchip-on" : ""}`} onClick={() => setVaultFilter(v => v === "vaulted"   ? "all" : "vaulted")}>Vaulted</button>
+          <button className={`fchip${ownedOnly ? " fchip-on" : ""}`} onClick={() => setOwnedOnly(v => !v)}>Owned Only</button>
+        </div>
+        <span className="planner-count" style={{ marginLeft: "auto" }}>{plannerRows.length} relics</span>
+      </div>
+
+      {/* Column header */}
+      <div className="planner-header-row">
+        <div className="planner-col-name">
+          <button className={`planner-col-sortable${sortCol === "name" ? " active" : ""}`} onClick={() => handleSort("name")}>
+            Relic{sortArrow("name")}
+          </button>
+          <button className={`planner-col-sortable planner-col-owned-hdr${sortCol === "owned" ? " active" : ""}`} onClick={() => handleSort("owned")}>
+            Owned{sortArrow("owned")}
+          </button>
+        </div>
+        {PLANNER_TIERS.map(t => (
+          <button key={t} className={`planner-col-tier planner-col-sortable${sortCol === t ? " active" : ""}`} onClick={() => handleSort(t)}>
+            {TIER_LABEL[t]}{sortArrow(t)}
+          </button>
+        ))}
+        <button className={`planner-col-refine planner-col-sortable${sortCol === "gain" ? " active" : ""}`} onClick={() => handleSort("gain")}>
+          Refine gain{sortArrow("gain")}
+        </button>
+        <div className="planner-expand-spacer" aria-hidden />
+      </div>
+
+      {/* Rows */}
+      <div className="planner-list">
+        {plannerRows.length === 0 ? (
+          <div className="empty-msg">No relics match. Try turning off Owned Only.</div>
+        ) : plannerRows.map(({ drop, rewards, vals, evByTier, bestTier, totalOwned, vaulted }) => {
+          const isOpen = expanded === drop.fullName;
+          const gain   = evByTier.radiant - evByTier.intact;
+          return (
+            <div key={drop.fullName} className="planner-row">
+              <div className="planner-row-main" onClick={() => setExpanded(isOpen ? null : drop.fullName)}>
+                <div className="planner-col-name">
+                  <span className="planner-relic-name">{drop.fullName}</span>
+                  {vaulted && <span className="vault-badge vault-yes" style={{ fontSize: 9 }}>🔒</span>}
+                  <span className="planner-owned">×{totalOwned}</span>
+                </div>
+                {PLANNER_TIERS.map(t => (
+                  <div key={t} className={`planner-col-tier planner-ev${t === bestTier ? " planner-ev-best" : ""}`}>
+                    {evByTier[t] < 0.05 ? <span className="planner-ev-zero">—</span> : `${evByTier[t].toFixed(1)}${unit}`}
+                  </div>
+                ))}
+                <div className="planner-col-refine">
+                  {gain >= 0.1
+                    ? <span className="planner-gain-pos">+{gain.toFixed(1)}{unit}</span>
+                    : <span className="planner-gain-neg">{gain.toFixed(1)}{unit}</span>}
+                </div>
+                <button className="planner-expand-btn">{isOpen ? "▲" : "▼"}</button>
+              </div>
+
+              {isOpen && (
+                <div className="planner-reward-detail">
+                  <div className="planner-detail-tier-row">
+                    {PLANNER_TIERS.map(t => (
+                      <span key={t} className="planner-detail-tier-label">{TIER_LABEL[t]}: {DROP_RATES[t].Rare * 100}% rare</span>
+                    ))}
+                  </div>
+                  {rewards.map((r, i) => {
+                    const rates = DROP_RATES[bestTier];
+                    const chance = rates[r.rarity as keyof typeof rates] ?? 0;
+                    const cls = RARITY_CSS[r.rarity] ?? "bronze";
+                    return (
+                      <div key={i} className={`planner-reward-row planner-reward-${cls}`}>
+                        <span className={`relic-rl-${cls} planner-reward-rarity`}>{r.rarity[0]}</span>
+                        <span className="planner-reward-name">{r.itemName}</span>
+                        <span className="planner-reward-chance">{(chance * 100).toFixed(2)}%</span>
+                        <span className="planner-reward-val">{vals[i] > 0 ? `${vals[i]}${unit}` : "—"}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 // ─── Main component ───────────────────────────────────────────────────────────
 
 export default function RelicHelper({ inventory, refreshKey, colorblindMode = false, filters, onFiltersChange }: Props) {
+  const [plannerActive, setPlannerActive] = useState(false);
+  const [relicView, setRelicView] = useState<ViewMode>(() =>
+    (localStorage.getItem("ff-view-relic") as ViewMode | null) ?? "cards"
+  );
   const [allItems,    setAllItems]    = useState<CatalogItem[]>([]);
   const [drops,       setDrops]       = useState<RelicDrop[]>([]);
   const [dropLoading, setDropLoading] = useState(false);
@@ -492,6 +835,20 @@ export default function RelicHelper({ inventory, refreshKey, colorblindMode = fa
 
   return (
     <div className="relic-helper">
+      {/* Sub-tab bar */}
+      <div className="relic-subtab-bar">
+        <button className={`relic-subtab${!plannerActive ? " active" : ""}`} onClick={() => setPlannerActive(false)}>Relics</button>
+        <button className={`relic-subtab${plannerActive  ? " active" : ""}`} onClick={() => setPlannerActive(true)}>Planner</button>
+      </div>
+
+      {plannerActive ? (
+        <PlannerTab
+          drops={drops}
+          nameMap={nameMap}
+          catalogRelicByName={catalogRelicByName}
+          inventory={inventory}
+        />
+      ) : (<>
       <div className="market-header">
         <input
           className="foundry-search" style={{ width: 220 }}
@@ -525,6 +882,7 @@ export default function RelicHelper({ inventory, refreshKey, colorblindMode = fa
           <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--muted)" }}>
             {dropLoading ? "Loading…" : `${visibleDrops.length} relics · ${ownedCount} owned`}
           </span>
+          <ViewToggle view={relicView} onChange={v => { setRelicView(v); localStorage.setItem("ff-view-relic", v); }} />
           <HelpTip items={[
             { border: "#e8923a", icon: "C", label: "Common",   desc: "Bronze border — ~25% chance per run" },
             { border: "#c0c0c0", icon: "U", label: "Uncommon", desc: "Silver border — ~11% chance per run" },
@@ -551,7 +909,7 @@ export default function RelicHelper({ inventory, refreshKey, colorblindMode = fa
         </div>
       )}
 
-      <div className="relic-list">
+      <div className={`relic-list relic-list-${relicView}`}>
         {visibleDrops.length === 0 ? (
           <div className="empty-msg">{dropLoading ? "Fetching drop data…" : "No relics match."}</div>
         ) : pagedDrops.map(drop => (
@@ -564,9 +922,11 @@ export default function RelicHelper({ inventory, refreshKey, colorblindMode = fa
             searchQ={searchQ}
             nameMap={nameMap}
             colorblindMode={colorblindMode}
+            view={relicView}
           />
         ))}
       </div>
+      </>)}
     </div>
   );
 }
