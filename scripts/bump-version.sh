@@ -8,20 +8,17 @@
 set -euo pipefail
 
 if [ $# -ne 1 ]; then
-  echo "usage: $0 <version>   e.g. $0 2.8.0+linux.2" >&2
+  echo "usage: $0 <version>   e.g. $0 2.8.0-linux.2" >&2
   exit 1
 fi
 new="$1"
 
-# The fork's scheme is <upstream-semver>+linux.<n>; anything else is a typo
-# or an upstream version that forgot its build metadata.
-case "$new" in
-  [0-9]*.[0-9]*.[0-9]*+linux.[0-9]*) ;;
-  *)
-    echo "version must look like <upstream>+linux.<n>, e.g. 2.8.0+linux.2" >&2
-    exit 1
-    ;;
-esac
+# A regex rather than a case glob: globs would wave through trailing garbage
+# like 2.9.0-linux.1junk.
+if [[ ! "$new" =~ ^[0-9]+\.[0-9]+\.[0-9]+-linux\.[0-9]+$ ]]; then
+  echo "version must look like <upstream>-linux.<n>, e.g. 2.8.0-linux.2" >&2
+  exit 1
+fi
 
 root="$(dirname "$0")/.."
 

@@ -1,4 +1,4 @@
-# FrameForge — Warframe Companion `v2.9.0+linux.2`
+# FrameForge — Warframe Companion `v2.9.0-linux.3`
 
 A desktop companion for Warframe — live inventory, market prices, trading, timers, relic overlay, and riven analysis. Read-only, no game modification.
 
@@ -10,7 +10,7 @@ A desktop companion for Warframe — live inventory, market prices, trading, tim
 
 ## About this fork
 
-This is the Linux fork of [WyrmStudios/FrameForge](https://github.com/WyrmStudios/FrameForge). It exists because the Linux port was declined upstream, not because of a disagreement: upstream is the project, this is its platform branch, and fixes that are not Linux-specific are still sent upstream as individual pull requests. The app, its name and its bundle identifier are unchanged from upstream, so the version string is what separates the two: `2.9.0+linux.1` is upstream's 2.9.0 plus this fork's Linux work, and `+linux.<n>` counts the Linux-only releases cut on that base.
+This is the Linux fork of [WyrmStudios/FrameForge](https://github.com/WyrmStudios/FrameForge). It exists because the Linux port was declined upstream, not because of a disagreement: upstream is the project, this is its platform branch, and fixes that are not Linux-specific are still sent upstream as individual pull requests. The app, its name and its bundle identifier are unchanged from upstream, so the version string is what separates the two: `2.9.0-linux.1` is built on upstream's 2.9.0, and `-linux.<n>` counts the Linux-only releases cut on that base.
 
 Releases here are Linux only: `.deb`, `.rpm` and `.AppImage`. **Windows users want [upstream's releases](https://github.com/WyrmStudios/FrameForge/releases)**, not this repository.
 
