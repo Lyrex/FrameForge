@@ -2047,6 +2047,16 @@ fn x11_window_title(conn: &xcb::Connection, window: xcb::x::Window) -> Option<St
         .or_else(|| read(xcb::x::ATOM_WM_NAME, xcb::x::ATOM_STRING))
 }
 
+/// Check if an X11 window is mapped and managed (viewable and not override-redirect).
+/// Used during QueryTree fallback to filter out unmapped helper windows, popups, and tooltips.
+#[cfg(target_os = "linux")]
+fn x11_window_viewable(conn: &xcb::Connection, window: xcb::x::Window) -> bool {
+    let cookie = conn.send_request(&xcb::x::GetWindowAttributes { window });
+    conn.wait_for_reply(cookie).is_ok_and(|reply| {
+        reply.map_state() == xcb::x::MapState::Viewable && !reply.override_redirect()
+    })
+}
+
 /// Find the game's window. Errors when Warframe is not running, which the
 /// callers surface as "capture failed" rather than as an empty frame.
 ///
@@ -2059,7 +2069,8 @@ fn x11_window_title(conn: &xcb::Connection, window: xcb::x::Window) -> Option<St
 /// and compositors (like Niri) that do not publish EWMH client lists.
 #[cfg(target_os = "linux")]
 fn warframe_window(conn: &xcb::Connection) -> Result<xcb::x::Window, String> {
-    if let Ok(client_list) = x11_atom(conn, "_NET_CLIENT_LIST_STACKING") {
+    let client_list = x11_atom(conn, "_NET_CLIENT_LIST_STACKING")?;
+    if client_list != xcb::x::ATOM_NONE {
         for screen in conn.get_setup().roots() {
             let cookie = conn.send_request(&xcb::x::GetProperty {
                 delete: false,
@@ -2069,25 +2080,26 @@ fn warframe_window(conn: &xcb::Connection) -> Result<xcb::x::Window, String> {
                 long_offset: 0,
                 long_length: 1024,
             });
-            let Ok(reply) = conn.wait_for_reply(cookie) else {
-                continue;
-            };
-            for &window in reply.value::<xcb::x::Window>() {
-                if x11_window_title(conn, window).as_deref() == Some(WARFRAME_WINDOW_TITLE) {
-                    return Ok(window);
+            if let Ok(reply) = conn.wait_for_reply(cookie) {
+                for &window in reply.value::<xcb::x::Window>() {
+                    if x11_window_title(conn, window).as_deref() == Some(WARFRAME_WINDOW_TITLE) {
+                        return Ok(window);
+                    }
                 }
             }
         }
     }
 
-    // Fallback for Xwayland compositors (like Niri) that don't publish _NET_CLIENT_LIST:
+    // Fallback for Xwayland compositors (like Niri) that don't publish _NET_CLIENT_LIST_STACKING.
+    // This only scans the top-level since Warframe is always found at this level.
     for screen in conn.get_setup().roots() {
         let tree_cookie = conn.send_request(&xcb::x::QueryTree {
             window: screen.root(),
         });
         if let Ok(reply) = conn.wait_for_reply(tree_cookie) {
             for &window in reply.children().iter().rev() {
-                if x11_window_title(conn, window).as_deref() == Some(WARFRAME_WINDOW_TITLE) {
+                if x11_window_viewable(conn, window)
+                    && x11_window_title(conn, window).as_deref() == Some(WARFRAME_WINDOW_TITLE) {
                     return Ok(window);
                 }
             }
