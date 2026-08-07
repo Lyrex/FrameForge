@@ -18,22 +18,22 @@ tauri-plugin-opener = "2"
 tokio = { version = "1", features = ["rt", "time", "net", "fs", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
-dirs = "5"
+dirs = "6"
 aho-corasick = "1"
-ureq = { version = "2", features = ["json"] }
-tungstenite = { version = "0.26", features = ["native-tls"] }
+ureq = { version = "3", features = ["json"] }
+tungstenite = { version = "0.30", features = ["native-tls"] }
 native-tls = "0.2"
-whirlpool = "0.10"
+whirlpool = "0.11"
 lzma-rs = "0.3"
 
 [profile.dev]
 opt-level = 1
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_Debug",
@@ -48,7 +48,7 @@ windows-sys = { version = "0.52", features = [
     "Win32_Storage_FileSystem",
     "Win32_Globalization",
 ] }
-windows = { version = "0.58", features = [
+windows = { version = "0.61", features = [
     "Media_Ocr",
     "Graphics_Imaging",
     "Storage_Streams",
