@@ -4831,6 +4831,7 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "lzma-rs",
+ "memchr",
  "native-tls",
  "regex",
  "rusqlite",
