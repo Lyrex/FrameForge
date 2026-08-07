@@ -1743,10 +1743,10 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
 }
 
 // `/Lotus/` alone recurs tens of thousands of times per inventory region, so
-// enumerating every match (the old `AhoCorasick::find_iter` pass) to answer
-// three yes/no questions dominated the scan at roughly 60 MiB/s. All three
-// questions are single `bool`s, so each is now a `memmem::find` that stops at
-// its first hit instead of an automaton walking to the end of the chunk.
+// enumerating every match to answer three yes/no questions costs roughly
+// 60 MiB/s. All three questions are single `bool`s, so each is a
+// `memmem::find` that stops at its first hit rather than an automaton pass
+// walking to the end of the chunk.
 #[cfg(target_os = "linux")]
 static PREFIX_FINDERS: LazyLock<Vec<memmem::Finder<'static>>> = LazyLock::new(|| {
     [
@@ -1829,18 +1829,16 @@ fn scan_linux_inventory_regions(
     // exclusive `&mut bool` capture would keep that closure's borrow alive
     // across both calls, blocking the plain read between them.
     let found_something = std::cell::Cell::new(false);
-    // walk_regions owns the read call now, so it cannot be timed directly;
-    // the gap between one visit call returning and the next one starting is
-    // exactly the next read's duration, which is the same quantity the old
-    // inline loop measured by wrapping `process.read` itself.
+    // walk_regions owns the read call, so it cannot be timed directly; the gap
+    // between one visit call returning and the next one starting is exactly
+    // the next read's duration.
     let mut last_visit = std::time::Instant::now();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT);
 
-    // `return` inside this closure exits only the closure, matching the early
-    // returns the pre-split loop body took from the function itself. Split
-    // out of the `visit` closure passed below so the read-timer wrapping it
-    // measures only the read, not this bookkeeping.
+    // `return` inside this closure ends the chunk, not the walk; `outcome`
+    // carries the verdict out. Kept separate from the `visit` closure below so
+    // the read timer there measures only the read, not this bookkeeping.
     let mut process_chunk = |address: usize, chunk: &[u8]| -> bool {
         regions_visited += 1;
         bytes_read += chunk.len() as u64;
@@ -1987,13 +1985,10 @@ fn scan_linux_inventory_regions(
     // Wine prefix's mapped files) hold no heap JSON in practice, so they are
     // read only as a fallback: pass 1 walks the anonymous mappings, and pass
     // 2 walks the file-backed remainder only if pass 1 turned up nothing.
-    // Worst case — an anonymous-first miss — reads exactly the set today's
-    // single-pass walk read; the typical case skips most of it. Windows
-    // takes the mirror-image shortcut in `capture_all_blobs` by rejecting
-    // `MEM_IMAGE` outright, since PE const-string sections false-trigger the
-    // Lotus anchor check there; Wine's heap being anonymous today is not a
-    // guarantee for every future Wine version, hence the fallback tier
-    // instead of dropping file-backed mappings outright.
+    // Wine's heap being anonymous is one Wine version's implementation detail,
+    // not a guarantee, so the second tier stays rather than rejecting
+    // file-backed mappings outright the way Windows rejects `MEM_IMAGE` in
+    // `capture_all_blobs`. Worst case both passes run and read everything.
     let (anon_regions, file_regions): (Vec<LinuxRegion>, Vec<LinuxRegion>) = regions
         .into_iter()
         .filter(|region| {
@@ -2018,8 +2013,6 @@ fn scan_linux_inventory_regions(
         });
     }
 
-    // Printed once regardless of which path above set `outcome`, so the
-    // caller always leaves a timing trail.
     eprintln!(
         "[blob-scan] done: regions={} bytes={}MB read={:.0}ms search={:.0}ms total={:.0}ms",
         regions_visited, bytes_read / 1_000_000,
@@ -2098,10 +2091,8 @@ fn scan_linux_cached_blob(
     let mut next = index + 1;
     // Mirrors the cursor in scan_linux_inventory_regions: only the
     // newly-appended bytes are rescanned, backed off by one marker length so
-    // a copy split across a mapping boundary is still caught.
-    // Once the marker has been seen the cursor stops moving: the marker can sit
-    // flush against a boundary with its closing `}` still to come, and a cursor
-    // that walked past it would never see it again.
+    // a copy split across a mapping boundary is still caught, and latching on
+    // the marker rather than advancing past it.
     let mut search_from = 0;
     let mut end_seen = false;
     let mut buffer = Vec::new();
@@ -2491,10 +2482,6 @@ pub fn find_riven_validity_va(pid: u32) -> Option<usize> {
 /// and one data section keep the pathname, while `.text` becomes a large
 /// anonymous executable mapping wedged between them. So the module is
 /// identified by the span its named mappings bracket, not by file backing.
-///
-/// Takes the region list the caller already discovered rather than
-/// re-reading and re-parsing `/proc/pid/maps` by hand, now that `LinuxRegion`
-/// carries the pathname this needs.
 #[cfg(target_os = "linux")]
 fn linux_game_image_span(regions: &[LinuxRegion]) -> Option<std::ops::Range<usize>> {
     regions
@@ -2541,8 +2528,6 @@ pub fn find_riven_validity_va(pid: u32) -> Option<usize> {
     // which is where the RIP-relative address is measured from.
     const STORE_LEN: usize = 7;
 
-    // Fetched once and handed to both the span lookup and the walk below,
-    // rather than each re-reading and re-parsing `/proc/pid/maps` on its own.
     let regions = linux_process_regions(pid).ok()?;
     let span = linux_game_image_span(&regions)?;
     let process = LinuxProcess::open(pid).ok()?;
@@ -2772,10 +2757,6 @@ static BLOB_DIGEST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 mod blob_digest_tests {
     use super::{blob_unchanged, forget_blob_digest, reset_last_blob_region, BLOB_DIGEST_TEST_LOCK};
 
-    // LAST_BLOB_DIGEST is a process-global static shared with every other
-    // test in this binary, so each case takes BLOB_DIGEST_TEST_LOCK, resets
-    // the digest, and runs its assertions in one #[test] rather than relying
-    // on test isolation.
     #[test]
     fn digest_tracks_changes_and_resets() {
         let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2985,10 +2966,6 @@ mod linux_tests {
         reset_last_blob_region();
     }
 
-    /// Seeing the end marker is not the same as having the object's closing
-    /// brace: the marker can land flush against a mapping boundary with the
-    /// `}` only arriving in the next read. The stitch has to keep going, and
-    /// keep remembering the marker it already passed.
     #[test]
     fn linux_cached_blob_keeps_stitching_when_end_brace_lands_in_next_mapping() {
         let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3039,15 +3016,11 @@ mod linux_tests {
             CachedBlobScan::Unchanged => panic!("first sighting of this blob must parse"),
         }
 
-        // Same address, same bytes: the digest recorded by the first call must
-        // suppress the reparse on the second.
         match scan_linux_cached_blob(&process, &regions).expect("second scan still finds the region") {
             CachedBlobScan::Unchanged => {}
             CachedBlobScan::Fresh(..) => panic!("identical bytes must not be reparsed"),
         }
 
-        // reset_last_blob_region clears the digest baseline along with the
-        // region cache, so the same bytes are treated as new again.
         reset_last_blob_region();
         LAST_BLOB_REGION.store(data.as_ptr() as u64, std::sync::atomic::Ordering::Relaxed);
         match scan_linux_cached_blob(&process, &regions).expect("scan after reset parses again") {
@@ -3087,9 +3060,6 @@ mod linux_tests {
         );
     }
 
-    /// The walk reports an unchanged blob rather than calling `on_blob`, so the
-    /// caller must not read that as "nothing found" and warn the user that no
-    /// inventory is in memory.
     #[test]
     fn linux_inventory_scan_reports_unchanged_instead_of_reparsing() {
         let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3308,13 +3278,8 @@ mod linux_tests {
         reset_last_blob_region();
     }
 
-    /// The cold walk juggles multiple concurrent `ActiveScan`s, each with its
-    /// own `search_from` cursor. When the end marker lands flush against a
-    /// mapping boundary, an unlatched cursor advances to just past the
-    /// marker's start on the next round rather than past the whole marker,
-    /// so a later re-search can miss it entirely once one more mapping goes
-    /// by without resolving the scan. Needs four mappings, not two: the
-    /// unlatched cursor lags one round behind and happens to paper over a
+    /// Needs four mappings, not two: an `ActiveScan` cursor that does not latch
+    /// on the marker lags one round behind and happens to paper over a
     /// two-mapping gap, so a filler mapping is required to expose the loss.
     #[test]
     fn linux_inventory_scan_completes_when_marker_flush_at_mapping_edge() {
@@ -3394,9 +3359,6 @@ mod linux_tests {
         assert_eq!(inventory.expect("inventory blob is found").credits, 42);
     }
 
-    /// Regression test for the pre-cap that shrank `regions` to `MAX_READ`
-    /// before `walk_regions` could chunk it, silently dropping everything
-    /// past the first 64 MiB of a large mapping.
     #[test]
     fn linux_inventory_scan_finds_blob_past_first_chunk_boundary() {
         let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3434,8 +3396,7 @@ mod linux_tests {
     /// The harder cousin of the test above: the blob physically spans the
     /// 64 MiB chunk seam. The start marker sits in the first chunk (opening an
     /// `ActiveScan`) while the end marker and closing brace land in the second,
-    /// so the seed opened in chunk A must be stitched to chunk B to parse. The
-    /// old pre-cap dropped chunk B entirely, losing every straddling blob.
+    /// so the seed opened in chunk A must be stitched to chunk B to parse.
     #[test]
     fn linux_inventory_scan_finds_blob_straddling_chunk_boundary() {
         let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3527,9 +3488,6 @@ mod linux_tests {
         );
     }
 
-    /// `[heap]`/`[stack]` are labeled anonymous memory, not files, so they stay
-    /// first-pass candidates; `[vvar]`/`[vsyscall]` are kernel data pages that
-    /// hold no heap JSON and must be candidates in neither pass.
     #[test]
     fn classifies_pathnames_and_pseudo_paths() {
         let maps = "\
