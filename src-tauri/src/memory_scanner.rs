@@ -617,7 +617,12 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
                 });
                 continue;
             }
-            let mc = mods.entry(it.to_string()).or_default();
+            // Duplicate ItemTypes dominate this map, so check get_mut before
+            // paying for entry()'s unconditional to_string() allocation.
+            let mc = match mods.get_mut(it) {
+                Some(mc) => mc,
+                None => mods.entry(it.to_string()).or_default(),
+            };
             *mc.by_rank.entry(0).or_insert(0) += count;
             mc.total += count;
         }
@@ -678,7 +683,10 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
                 }
             }
             let rank = blob_extract_mod_rank(e["UpgradeFingerprint"].as_str());
-            let mc = mods.entry(it.to_string()).or_default();
+            let mc = match mods.get_mut(it) {
+                Some(mc) => mc,
+                None => mods.entry(it.to_string()).or_default(),
+            };
             *mc.by_rank.entry(rank).or_insert(0) += 1;
             mc.total += 1;
         }
@@ -690,7 +698,10 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
         for e in arr {
             let Some(it) = e["ItemType"].as_str() else { continue };
             if !it.starts_with("/Lotus/") { continue; }
-            *flavour_items.entry(it.to_string()).or_insert(0) += 1;
+            match flavour_items.get_mut(it) {
+                Some(v) => *v += 1,
+                None => { flavour_items.insert(it.to_string(), 1); }
+            }
         }
     }
 
@@ -701,7 +712,10 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
         for e in arr {
             let Some(it) = e["ItemType"].as_str() else { continue };
             if !it.starts_with("/Lotus/") { continue; }
-            *weapon_skins.entry(it.to_string()).or_insert(0) += 1;
+            match weapon_skins.get_mut(it) {
+                Some(v) => *v += 1,
+                None => { weapon_skins.insert(it.to_string(), 1); }
+            }
         }
     }
 
