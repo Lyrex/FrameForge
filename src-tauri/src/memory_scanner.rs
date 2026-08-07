@@ -1,6 +1,4 @@
-﻿#[cfg(target_os = "linux")]
-use aho_corasick::AhoCorasick;
-use memchr::memmem;
+﻿use memchr::memmem;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -1755,38 +1753,28 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
     saved
 }
 
-// Warframe's address space is several gigabytes, and the naive
-// `windows().any()` form of these searches walks every byte position once per
-// marker — eight separate passes per region, which dominated the scan at
-// roughly 60 MiB/s. `LazyLock` compiles the automaton once instead of on
-// every call to the functions below.
+// `/Lotus/` alone recurs tens of thousands of times per inventory region, so
+// enumerating every match (the old `AhoCorasick::find_iter` pass) to answer
+// three yes/no questions dominated the scan at roughly 60 MiB/s. All three
+// questions are single `bool`s, so each is now a `memmem::find` that stops at
+// its first hit instead of an automaton walking to the end of the chunk.
 #[cfg(target_os = "linux")]
-static MARKERS: LazyLock<AhoCorasick> = LazyLock::new(|| {
-    AhoCorasick::new(
-        std::iter::once(b"\"SubscribedToEmails\"".as_slice())
-            .chain(std::iter::once(b"\"InventoryChanges\":".as_slice()))
-            .chain(
-                [
-                    b"/Lotus/".as_slice(),
-                    b"\"MiscItems\":[",
-                    b"\"Suits\":[",
-                    b"\"LongGuns\":[",
-                    b"\"Melee\":[",
-                    b"\"Pistols\":[",
-                ]
-                .into_iter(),
-            ),
-    )
-    .expect("marker set is a valid literal alternation")
+static PREFIX_FINDERS: LazyLock<Vec<memmem::Finder<'static>>> = LazyLock::new(|| {
+    [
+        b"/Lotus/".as_slice(),
+        b"\"MiscItems\":[",
+        b"\"Suits\":[",
+        b"\"LongGuns\":[",
+        b"\"Melee\":[",
+        b"\"Pistols\":[",
+    ]
+    .into_iter()
+    .map(memmem::Finder::new)
+    .collect()
 });
 #[cfg(target_os = "linux")]
-const START_PATTERN: usize = 0;
-#[cfg(target_os = "linux")]
-const MISSION_PATTERN: usize = 1;
-
-// Single-literal searches use `memmem::Finder` rather than a one-pattern
-// Aho-Corasick automaton — Aho-Corasick's construction overhead only pays for
-// itself with multiple patterns searched together.
+static START_FINDER: LazyLock<memmem::Finder<'static>> =
+    LazyLock::new(|| memmem::Finder::new(b"\"SubscribedToEmails\"".as_slice()));
 #[cfg(target_os = "linux")]
 static END_FINDER: LazyLock<memmem::Finder<'static>> =
     LazyLock::new(|| memmem::Finder::new(b"\"DeathSquadable\":".as_slice()));
@@ -1918,16 +1906,12 @@ fn scan_linux_inventory_regions(
         }
 
         let t1 = std::time::Instant::now();
-        let mut is_mission = false;
-        let mut start_offset = None;
-        let mut has_prefix = false;
-        for found in MARKERS.find_iter(chunk) {
-            match found.pattern().as_usize() {
-                MISSION_PATTERN => is_mission = true,
-                START_PATTERN => start_offset = start_offset.or(Some(found.start())),
-                _ => has_prefix = true,
-            }
-        }
+        // The mission-delta scan only runs once a prefix or start hit is
+        // known, since a region matching neither is rejected either way.
+        let has_prefix = PREFIX_FINDERS.iter().any(|finder| finder.find(chunk).is_some());
+        let start_offset = START_FINDER.find(chunk);
+        let is_mission = (has_prefix || start_offset.is_some())
+            && MISSION_FINDER.find(chunk).is_some();
         t_search += t1.elapsed();
         if start_offset.is_none() && !is_mission && has_prefix {
             while prefix.iter().map(|item| item.data.len()).sum::<usize>() + read > PREFIX_BYTES
@@ -3297,6 +3281,34 @@ mod linux_tests {
         });
 
         assert_eq!(inventory.expect("inventory blob is found").credits, 42);
+    }
+
+    /// A mission-reward delta carries `/Lotus/` paths and inventory-shaped
+    /// keys but no start marker, so the early-exiting qualification must
+    /// still reject it rather than mistaking the prefix hit for a real seed.
+    #[test]
+    fn linux_inventory_scan_rejects_mission_delta_without_start_marker() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_last_blob_region();
+
+        let mut mission = br#"{"InventoryChanges":{"MiscItems":[{"ItemType":"/Lotus/Types/Items/x"}]}"#.to_vec();
+        mission.resize(128_000, b' ');
+        let regions = vec![LinuxRegion {
+            start: mission.as_ptr() as usize,
+            len: mission.len(),
+            executable: false,
+            ..Default::default()
+        }];
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+
+        let mut found = false;
+        scan_linux_inventory_regions(&process, regions, false, |_, _, _| {
+            found = true;
+            false
+        });
+
+        assert!(!found, "a mission delta with no start marker must never parse as an inventory blob");
+        reset_last_blob_region();
     }
 
     /// The cold walk juggles multiple concurrent `ActiveScan`s, each with its
