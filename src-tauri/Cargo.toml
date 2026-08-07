@@ -28,6 +28,7 @@ tungstenite = { version = "0.26", features = ["native-tls"] }
 native-tls = "0.2"
 whirlpool = "0.10"
 lzma-rs = "0.3"
+memchr = "2"
 
 [profile.dev]
 opt-level = 1

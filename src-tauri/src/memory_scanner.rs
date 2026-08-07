@@ -1,6 +1,8 @@
 ﻿#[cfg(target_os = "linux")]
 use aho_corasick::AhoCorasick;
+use memchr::memmem;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::fs::File;
@@ -80,7 +82,6 @@ pub struct PendingRecipe {
     pub completion_ms: i64,
 }
 
-/// One Archon Shard socketed into a Warframe.
 /// One Archon Shard socketed into a Warframe.
 /// `upgrade_type` is the effect path (e.g. `.../ArchonCrystalUpgradeWarframeEnergyMax`).
 /// `color` is the raw string value from the JSON (e.g. `"ACC_CRIMSON"`, `"ACC_AZURE_TAUFORGED"`).
@@ -166,37 +167,6 @@ pub fn xp_to_rank(xp: i64, path: &str) -> u32 {
     ((xp as f64 / base).sqrt().floor() as u32).min(30)
 }
 
-/// Diagnostic: find "CompletionDate" in any format and return a snippet of context.
-#[allow(dead_code)]
-pub fn scan_completion_date_context(data: &[u8]) -> Vec<String> {
-    let key = b"\"CompletionDate\"";
-    let mut results = Vec::new();
-    let mut start = 0usize;
-    loop {
-        let next = match data[start..].iter().position(|&b| b == b'"') {
-            Some(p) => start + p,
-            None => break,
-        };
-        if next + key.len() > data.len() { break; }
-        if data[next..next + key.len()] != *key {
-            start = next + 1; continue;
-        }
-        // Capture 120 bytes of context starting 40 bytes before the key
-        let ctx_start = next.saturating_sub(40);
-        let ctx_end   = (next + 120).min(data.len());
-        let ctx = &data[ctx_start..ctx_end];
-        // Only include printable ASCII so the log is readable
-        let s: String = ctx.iter()
-            .map(|&b| if b >= 0x20 && b < 0x7f { b as char } else { '·' })
-            .collect();
-        results.push(s);
-        start = next + key.len();
-        if results.len() >= 3 { break; } // cap at 3 samples
-    }
-    results
-}
-
-
 // ─── Auth credentials scan ───────────────────────────────────────────────────
 //
 // When Warframe is running and logged in, the game stores the session credentials
@@ -216,26 +186,19 @@ pub fn scan_auth_credentials(data: &[u8]) -> Option<(String, String)> {
     // Search for "id":"<24hexchars>" near "Nonce":<digits>
     let id_key = b"\"id\":\"";
     let nonce_key = b"\"Nonce\":";
-    let mut search = 0usize;
-    while search + id_key.len() < data.len() {
-        let next = match data[search..].iter().position(|&b| b == b'"') {
-            Some(p) => search + p, None => break,
-        };
-        if next + id_key.len() > data.len() { break; }
-        if data[next..next + id_key.len()] != *id_key { search = next + 1; continue; }
-
+    for next in memmem::find_iter(data, id_key) {
         let id_start = next + id_key.len();
         // accountId is exactly 24 lowercase hex chars
         let id_slice = &data[id_start..id_start.saturating_add(26).min(data.len())];
         let close = id_slice.iter().position(|&b| b == b'"').unwrap_or(0);
-        if close != 24 { search = next + 1; continue; }
+        if close != 24 { continue; }
         let id_bytes = &id_slice[..24];
-        if !id_bytes.iter().all(|&b| b.is_ascii_hexdigit()) { search = next + 1; continue; }
+        if !id_bytes.iter().all(|&b| b.is_ascii_hexdigit()) { continue; }
         let account_id = std::str::from_utf8(id_bytes).unwrap_or("").to_string();
 
         // Look for Nonce within 2048 bytes
         let nonce_search_end = (id_start + 2048).min(data.len());
-        if let Some(rel) = data[id_start..nonce_search_end].windows(nonce_key.len()).position(|w| w == *nonce_key) {
+        if let Some(rel) = memmem::find(&data[id_start..nonce_search_end], nonce_key) {
             let ns = id_start + rel + nonce_key.len();
             let ne = digits_end(data, ns);
             if ne > ns && ne - ns >= 5 {
@@ -244,26 +207,19 @@ pub fn scan_auth_credentials(data: &[u8]) -> Option<(String, String)> {
                 }
             }
         }
-        search = next + 1;
     }
 
     // URL-encoded: accountId=<24hexchars>&nonce=<10digits>&ct=STM
     let ak = b"accountId=";
     let nk = b"nonce=";
-    let mut search = 0usize;
-    while search + ak.len() < data.len() {
-        let next = match data[search..].iter().position(|&b| b == b'a') {
-            Some(p) => search + p, None => break,
-        };
-        if next + ak.len() > data.len() { break; }
-        if data[next..next + ak.len()] != *ak { search = next + 1; continue; }
+    for next in memmem::find_iter(data, ak) {
         let id_start = next + ak.len();
         let id_end = data[id_start..].iter().position(|&b| !b.is_ascii_hexdigit()).map(|p| id_start + p).unwrap_or(data.len());
-        if id_end - id_start != 24 { search = next + 1; continue; }
+        if id_end - id_start != 24 { continue; }
         let account_id = std::str::from_utf8(&data[id_start..id_end]).unwrap_or("").to_string();
         // Nonce can appear anywhere within 512 bytes after the accountId
         let nonce_search_end = (id_end + 512).min(data.len());
-        if let Some(rel) = data[id_end..nonce_search_end].windows(nk.len()).position(|w| w == *nk) {
+        if let Some(rel) = memmem::find(&data[id_end..nonce_search_end], nk) {
             let ns = id_end + rel + nk.len();
             let ne = digits_end(data, ns);
             if ne > ns && ne - ns >= 5 {
@@ -272,7 +228,6 @@ pub fn scan_auth_credentials(data: &[u8]) -> Option<(String, String)> {
                 }
             }
         }
-        search = next + 1;
     }
     None
 }
@@ -280,13 +235,7 @@ pub fn scan_auth_credentials(data: &[u8]) -> Option<(String, String)> {
 /// Also extract steamId from memory (found near accountId/nonce in URL params).
 pub fn scan_steam_id(data: &[u8]) -> Option<String> {
     let key = b"steamId=";
-    let mut search = 0usize;
-    loop {
-        let next = match data[search..].iter().position(|&b| b == b's') {
-            Some(p) => search + p, None => break,
-        };
-        if next + key.len() > data.len() { break; }
-        if data[next..next + key.len()] != *key { search = next + 1; continue; }
+    for next in memmem::find_iter(data, key) {
         let id_start = next + key.len();
         let id_end = data[id_start..].iter().position(|&b| !b.is_ascii_digit()).map(|p| id_start + p).unwrap_or(data.len());
         if id_end - id_start >= 15 && id_end - id_start <= 20 {
@@ -294,7 +243,6 @@ pub fn scan_steam_id(data: &[u8]) -> Option<String> {
                 return Some(sid.to_string());
             }
         }
-        search = next + 1;
     }
     None
 }
@@ -847,106 +795,16 @@ pub fn scan_api_url_strings() -> Result<Vec<String>, String> {
     Ok(found)
 }
 
-// ─── One-shot inventory blob capture ─────────────────────────────────────────
-//
-// Scans all committed readable regions for the first chunk that contains the
-// inventory root marker ("MiscItems":[).  Saves the full printable-text portion
-// of that region to `output_path` so it can be inspected offline.
-//
-// Non-printable bytes are replaced with '.' so the file is text-editor friendly.
-// Saves up to 8 MB centred on the MiscItems key (4 MB before, 4 MB after).
-
-#[cfg(target_os = "windows")]
-pub fn capture_inventory_blob(output_path: &std::path::Path) -> Result<String, String> {
-    use std::ffi::c_void;
-    use std::mem;
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, FALSE},
-        System::{
-            Diagnostics::Debug::ReadProcessMemory,
-            Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS},
-            Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
-        },
-    };
-
-    let pid = find_warframe_pid_pub().ok_or_else(|| "Warframe is not running".to_string())?;
-
-    let process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid) };
-    if process == 0 { return Err("Could not open Warframe process".to_string()); }
-
-    const MISC_KEY: &[u8]      = b"\"MiscItems\":[";
-    const MIN_BLOB_BYTES: usize = 200_000;    // skip tiny chunks — real inventory is MB-scale
-    const MAX_REGION_READ: usize = 128 * 1024 * 1024;
-    const HALF_SAVE: usize      = 4 * 1024 * 1024;   // 4 MB either side of MiscItems
-
-    let mut addr: usize = 0;
-    let mut saved: Option<(usize, String)> = None; // (region size, message)
-
-    'outer: loop {
-        let mut mbi = unsafe { mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
-        if unsafe { VirtualQueryEx(process, addr as *const c_void, &mut mbi, mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 { break; }
-
-        let region_addr = mbi.BaseAddress as usize;
-        let region_size = mbi.RegionSize;
-        let next_addr   = region_addr.saturating_add(region_size);
-
-        if mbi.State == MEM_COMMIT
-            && mbi.Protect & PAGE_GUARD    == 0
-            && mbi.Protect & PAGE_NOACCESS == 0
-            && region_size >= MIN_BLOB_BYTES
-            && region_size <= MAX_REGION_READ
-        {
-            let mut data = vec![0u8; region_size];
-            let mut n = 0usize;
-            if unsafe { ReadProcessMemory(process, region_addr as *const c_void, data.as_mut_ptr() as *mut c_void, region_size, &mut n) } != 0 && n >= MIN_BLOB_BYTES {
-                let data = &data[..n];
-                if let Some(misc_pos) = data.windows(MISC_KEY.len()).position(|w| w == MISC_KEY) {
-                    let start = misc_pos.saturating_sub(HALF_SAVE);
-                    let end   = (misc_pos + HALF_SAVE).min(data.len());
-                    let text: Vec<u8> = data[start..end].iter()
-                        .map(|&b| if b >= 0x20 && b <= 0x7e || b == b'\n' || b == b'\t' { b } else { b'.' })
-                        .collect();
-                    if let Err(e) = std::fs::write(output_path, &text) {
-                        unsafe { CloseHandle(process); }
-                        return Err(format!("Write failed: {e}"));
-                    }
-                    saved = Some((text.len(), format!(
-                        "Saved {}KB blob (region 0x{:x}, size {}KB, MiscItems at +{}KB) to {}",
-                        text.len() / 1024, region_addr, n / 1024, misc_pos / 1024,
-                        output_path.display()
-                    )));
-                    break 'outer;
-                }
-            }
-        }
-
-        if next_addr <= addr { break; }
-        addr = next_addr;
-    }
-
-    unsafe { CloseHandle(process); }
-
-    saved.map(|(_, msg)| msg)
-         .ok_or_else(|| "No inventory blob found — make sure Warframe is running and inventory is loaded (open Arsenal or Inventory screen)".to_string())
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn capture_inventory_blob(_output_path: &std::path::Path) -> Result<String, String> {
-    Err("Only supported on Windows".into())
-}
-
-/// Scan all Warframe process memory and save every relevant blob found into `blob_dir`.
-/// "Relevant" = region ≥ 100 KB that contains at least one of: MiscItems, Suits,
 // ─── Full-account blob parser ─────────────────────────────────────────────────
 
 /// Find the end of the FULL_ACCOUNT blob by locating `"DeathSquadable":` and
 /// the `}` that immediately follows its boolean value (true or false).
 fn find_blob_end(raw: &[u8]) -> Option<usize> {
     const KEY: &[u8] = b"\"DeathSquadable\":";
-    let key_pos = raw.windows(KEY.len()).position(|w| w == KEY)?;
+    let key_pos = memmem::find(raw, KEY)?;
     let after   = key_pos + KEY.len();
     // Skip the boolean value and find the closing brace
-    let brace = raw[after..].iter().position(|&b| b == b'}')?;
+    let brace = memchr::memchr(b'}', &raw[after..])?;
     Some(after + brace + 1)
 }
 
@@ -994,10 +852,7 @@ fn blob_seed_offsets(combined: &[u8]) -> (usize, usize) {
     // trying later marker occurrences until one qualifies.
     let mut first_marker = None;
     let mut search_from = 0;
-    while let Some(found) = combined[search_from..]
-        .windows(START_MARKER.len())
-        .position(|w| w == START_MARKER)
-    {
+    while let Some(found) = memmem::find(&combined[search_from..], START_MARKER) {
         let marker_at = search_from + found;
         first_marker.get_or_insert(marker_at);
         if let Some(open) = enclosing_object_start(combined, marker_at) {
@@ -1010,8 +865,7 @@ fn blob_seed_offsets(combined: &[u8]) -> (usize, usize) {
     // Without a plausible brace anywhere, seed at the first marker: the
     // parser can rebuild the object head from a marker-anchored seed.
     let marker_at = first_marker
-        .or_else(|| ALT_STARTS.iter().find_map(|a|
-            combined.windows(a.len()).position(|w| w == *a)))
+        .or_else(|| ALT_STARTS.iter().find_map(|a| memmem::find(combined, a)))
         .unwrap_or(combined.len().saturating_sub(1));
     (marker_at, first_marker.unwrap_or_else(||
         enclosing_object_start(combined, marker_at).unwrap_or(marker_at)))
@@ -1081,16 +935,30 @@ pub fn compute_riven_mod_name(buffs: &[BlobRivenStat]) -> String {
 /// final region — potentially tens of megabytes of noise. This trims to just
 /// the valid JSON object so both the parser and the debug dump files see clean data.
 pub fn extract_blob_json(raw: &[u8]) -> Option<Vec<u8>> {
+    extract_blob_json_ref(raw).map(Cow::into_owned)
+}
+
+/// Borrowing counterpart of [`extract_blob_json`]. The common case (buffer still
+/// starts with the original `{`) needs no copy at all; only the fallback path,
+/// where the opening brace was overwritten in memory and has to be reinstated,
+/// allocates.
+pub fn extract_blob_json_ref(raw: &[u8]) -> Option<Cow<'_, [u8]>> {
     let end_pos = find_blob_end(raw)?;
+    extract_blob_json_at(raw, end_pos)
+}
+
+/// Same as [`extract_blob_json_ref`] but takes an already-known `end_pos`, so
+/// callers that located the blob end for their own purposes (e.g. the
+/// minimum-size check in [`parse_full_account_blob`]) don't pay for a second scan.
+fn extract_blob_json_at(raw: &[u8], end_pos: usize) -> Option<Cow<'_, [u8]>> {
     if raw.first() == Some(&b'{') {
-        Some(raw[..end_pos].to_vec())
+        Some(Cow::Borrowed(&raw[..end_pos]))
     } else {
-        const START: &[u8] = b"\"SubscribedToEmails\"";
-        let start_pos = raw.windows(START.len()).position(|w| w == START)?;
+        let start_pos = memmem::find(raw, START_MARKER)?;
         let mut v = Vec::with_capacity(end_pos - start_pos + 1);
         v.push(b'{');
         v.extend_from_slice(&raw[start_pos..end_pos]);
-        Some(v)
+        Some(Cow::Owned(v))
     }
 }
 
@@ -1107,7 +975,7 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
         return None;
     }
 
-    let json_bytes = extract_blob_json(raw)?;
+    let json_bytes = extract_blob_json_at(raw, end_pos)?;
 
     let json: serde_json::Value = serde_json::from_slice(&json_bytes)
         .map_err(|e| {
@@ -1206,7 +1074,12 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
                 });
                 continue;
             }
-            let mc = mods.entry(it.to_string()).or_default();
+            // Duplicate ItemTypes dominate this map, so check get_mut before
+            // paying for entry()'s unconditional to_string() allocation.
+            let mc = match mods.get_mut(it) {
+                Some(mc) => mc,
+                None => mods.entry(it.to_string()).or_default(),
+            };
             *mc.by_rank.entry(0).or_insert(0) += count;
             mc.total += count;
         }
@@ -1267,7 +1140,10 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
                 }
             }
             let rank = blob_extract_mod_rank(e["UpgradeFingerprint"].as_str());
-            let mc = mods.entry(it.to_string()).or_default();
+            let mc = match mods.get_mut(it) {
+                Some(mc) => mc,
+                None => mods.entry(it.to_string()).or_default(),
+            };
             *mc.by_rank.entry(rank).or_insert(0) += 1;
             mc.total += 1;
         }
@@ -1279,7 +1155,10 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
         for e in arr {
             let Some(it) = e["ItemType"].as_str() else { continue };
             if !it.starts_with("/Lotus/") { continue; }
-            *flavour_items.entry(it.to_string()).or_insert(0) += 1;
+            match flavour_items.get_mut(it) {
+                Some(v) => *v += 1,
+                None => { flavour_items.insert(it.to_string(), 1); }
+            }
         }
     }
 
@@ -1290,7 +1169,10 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
         for e in arr {
             let Some(it) = e["ItemType"].as_str() else { continue };
             if !it.starts_with("/Lotus/") { continue; }
-            *weapon_skins.entry(it.to_string()).or_insert(0) += 1;
+            match weapon_skins.get_mut(it) {
+                Some(v) => *v += 1,
+                None => { weapon_skins.insert(it.to_string(), 1); }
+            }
         }
     }
 
@@ -1352,10 +1234,47 @@ fn blob_extract_mod_rank(fingerprint: Option<&str>) -> u8 {
 static LAST_BLOB_REGION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// Digest of the last blob whose bytes were about to be parsed. Inventory
+// changes maybe once per mission, so most 10s scan cycles find byte-identical
+// JSON — hashing a few MB is far cheaper than rebuilding BlobInventory's
+// HashMaps/Vecs from scratch every cycle.
+static LAST_BLOB_DIGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Clear the fast-path region cache. Call when Warframe's PID changes so the
 /// next scan doesn't probe a stale address from the previous process instance.
 pub fn reset_last_blob_region() {
     LAST_BLOB_REGION.store(0, std::sync::atomic::Ordering::Relaxed);
+    LAST_BLOB_DIGEST.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Discard the digest baseline so the next candidate is parsed no matter what
+/// its bytes are. Call after a parse failure: skipping a re-parse is only safe
+/// while the baseline names bytes that are known to parse, and `blob_unchanged`
+/// records its argument before the parse outcome is known.
+fn forget_blob_digest() {
+    LAST_BLOB_DIGEST.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Checks `json` against the digest recorded by the previous call, then
+/// records `json`'s digest as the new baseline — check-and-update in one
+/// step, so a caller should invoke this exactly once per candidate blob,
+/// right before deciding whether to parse it.
+///
+/// A caller that then fails to parse `json` must call `forget_blob_digest`:
+/// the skip paths treat a match as "already parsed this successfully", and
+/// unparseable bytes that persist across cycles would otherwise be mistaken
+/// for a result and suppress the rest of the walk indefinitely.
+///
+/// Returns true when `json` is byte-identical to what the previous call saw.
+fn blob_unchanged(json: &[u8]) -> bool {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    json.hash(&mut hasher);
+    // OR in a set bit so a hashed digest can never equal the 0 sentinel that
+    // reset_last_blob_region stores — that sentinel must always compare as
+    // "changed" to force a re-parse after a PID change.
+    let digest = hasher.finish() | 1;
+    LAST_BLOB_DIGEST.swap(digest, std::sync::atomic::Ordering::Relaxed) == digest
 }
 
 /// Scans Warframe process memory for the FULL_ACCOUNT inventory blob and sends it
@@ -1466,6 +1385,11 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
                             nb.as_mut_ptr() as *mut c_void, cap, &mut nn) } == 0 { continue; }
                         stitched.extend_from_slice(&nb[..nn]);
                     }
+                    if blob_unchanged(&stitched) {
+                        eprintln!("[blob] fast-path hit at 0x{:012x}: unchanged since last scan — skipping parse", cached_addr);
+                        unsafe { CloseHandle(process); }
+                        return 0;
+                    }
                     if let Some(inv) = parse_full_account_blob(&stitched) {
                         eprintln!("[blob] fast-path hit at 0x{:012x}: {} unique, {} stackable",
                             cached_addr, inv.unique_items.len(), inv.stackable_items.len());
@@ -1473,6 +1397,7 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
                         unsafe { CloseHandle(process); }
                         return 0; // fast path never saves to disk
                     }
+                    forget_blob_digest();
                 }
             }
         }
@@ -1584,6 +1509,12 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
                 .windows(END_MARKER.len())
                 .any(|w| w == END_MARKER);
             if has_end && find_blob_end(&scan.data).is_some() {
+                if !save && blob_unchanged(&scan.data) {
+                    eprintln!("[blob] scan#{} unchanged since last scan — skipping parse", scan.id);
+                    LAST_BLOB_REGION.store(scan.start_region_addr as u64, std::sync::atomic::Ordering::Relaxed);
+                    found_result = true;
+                    return false;
+                }
                 match parse_full_account_blob(&scan.data) {
                     Some(inv) => {
                         eprintln!("[blob] scan#{} SUCCESS at 0x{:012x}: {} unique, {} stackable, {} mods",
@@ -1602,6 +1533,7 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
                     }
                     None => {
                         eprintln!("[blob] scan#{} end marker found but JSON parse failed — dropped", scan.id);
+                        forget_blob_digest();
                     }
                 }
                 false // remove completed (or failed) scan
@@ -1678,7 +1610,12 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
             );
             let seed = combined[json_open..].to_vec();
 
-            if find_blob_end(&seed).is_some() {
+            let seed_ends = find_blob_end(&seed).is_some();
+            if seed_ends && !save && blob_unchanged(&seed) {
+                eprintln!("[blob] scan#{} immediate hit: unchanged since last scan — skipping parse", id);
+                LAST_BLOB_REGION.store(seed_addr as u64, std::sync::atomic::Ordering::Relaxed);
+                found_result = true;
+            } else if seed_ends {
                 match parse_full_account_blob(&seed) {
                     Some(inv) => {
                         eprintln!("[blob] scan#{} immediate SUCCESS at 0x{:012x}: {} unique, {} stackable",
@@ -1695,6 +1632,7 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
                     }
                     None => {
                         eprintln!("[blob] scan#{} immediate end found but parse failed — dropping", id);
+                        forget_blob_digest();
                     }
                 }
             } else {
@@ -2422,7 +2360,8 @@ fn find_warframe_pid() -> Option<u32> {
 
 #[cfg(test)]
 mod seed_tests {
-    use super::{enclosing_object_start, blob_seed_offsets, extract_blob_json};
+    use super::{enclosing_object_start, blob_seed_offsets, extract_blob_json, extract_blob_json_ref};
+    use std::borrow::Cow;
 
     #[test]
     fn enclosing_finds_outer_brace() {
@@ -2452,7 +2391,8 @@ mod seed_tests {
         let buf = b"{\"SubscribedToEmails\":1,\"RegularCredits\":100}";
         let (marker_off, json_open) = blob_seed_offsets(buf);
         assert_eq!(json_open, 0);
-        assert!(marker_off > 0);
+        // Both markers are present; the primary one must win over the alt-start.
+        assert_eq!(marker_off, 1);
     }
 
     #[test]
@@ -2514,6 +2454,106 @@ mod seed_tests {
         let json = extract_blob_json(&raw).expect("end marker present");
         assert_eq!(json.len(), blob_len);
         assert!(serde_json::from_slice::<serde_json::Value>(&json).is_ok());
+    }
+
+    #[test]
+    fn blob_json_reinstates_the_opening_brace_when_it_was_overwritten() {
+        let mut raw = br#"x"SubscribedToEmails":0,"DeathSquadable":false}"#.to_vec();
+        let blob_len = raw.len();
+        raw.extend(std::iter::repeat(0xABu8).take(1024));
+
+        let json = extract_blob_json(&raw).expect("end marker present");
+        assert_eq!(json.len(), blob_len);
+        assert_eq!(json[0], b'{');
+        assert!(serde_json::from_slice::<serde_json::Value>(&json).is_ok());
+    }
+
+    #[test]
+    fn blob_json_ref_borrows_in_the_common_case_and_owns_in_the_fallback() {
+        let intact = br#"{"SubscribedToEmails":0,"DeathSquadable":false}"#;
+        assert!(matches!(extract_blob_json_ref(intact), Some(Cow::Borrowed(_))));
+
+        let overwritten = br#"x"SubscribedToEmails":0,"DeathSquadable":false}"#;
+        assert!(matches!(extract_blob_json_ref(overwritten), Some(Cow::Owned(_))));
+    }
+}
+
+#[cfg(test)]
+mod blob_digest_tests {
+    use super::{blob_unchanged, forget_blob_digest, reset_last_blob_region};
+
+    // LAST_BLOB_DIGEST is a process-global static shared with every other
+    // test in this binary, so each case resets it first and runs its
+    // assertions in one #[test] rather than relying on test isolation.
+    #[test]
+    fn digest_tracks_changes_and_resets() {
+        reset_last_blob_region();
+
+        let blob = b"{\"SubscribedToEmails\":1,\"RegularCredits\":100}".to_vec();
+        assert!(!blob_unchanged(&blob), "first call always reports changed");
+        assert!(blob_unchanged(&blob), "identical bytes report unchanged");
+
+        let mut mutated = blob.clone();
+        mutated[0] = b'[';
+        assert!(!blob_unchanged(&mutated), "a changed byte must report changed");
+        assert!(blob_unchanged(&mutated), "the new bytes become the baseline");
+
+        reset_last_blob_region();
+        assert!(!blob_unchanged(&mutated), "reset forces the next call to report changed");
+    }
+
+    // Unparseable bytes that persist across scan cycles must not start
+    // reporting as unchanged — the skip paths read that as "already parsed
+    // this", which would wedge the walk on a region that never parsed.
+    #[test]
+    fn forgetting_after_a_failed_parse_forces_a_retry() {
+        reset_last_blob_region();
+
+        let garbage = b"{\"MiscItems\":[ truncated".to_vec();
+        assert!(!blob_unchanged(&garbage), "first sighting reports changed");
+        forget_blob_digest();
+        assert!(!blob_unchanged(&garbage), "same bytes report changed again after a failed parse");
+    }
+}
+
+#[cfg(test)]
+mod credential_scan_tests {
+    use super::{scan_auth_credentials, scan_steam_id};
+
+    #[test]
+    fn auth_credentials_finds_json_form() {
+        let buf = br#"{"id":"594144e63ade7f2f2091c48e","Nonce":123456789}"#;
+        let (account_id, nonce) = scan_auth_credentials(buf).expect("should find credentials");
+        assert_eq!(account_id, "594144e63ade7f2f2091c48e");
+        assert_eq!(nonce, "123456789");
+    }
+
+    #[test]
+    fn auth_credentials_finds_url_encoded_form() {
+        let buf = b"accountId=594144e63ade7f2f2091c48e&nonce=123456789&ct=STM";
+        let (account_id, nonce) = scan_auth_credentials(buf).expect("should find credentials");
+        assert_eq!(account_id, "594144e63ade7f2f2091c48e");
+        assert_eq!(nonce, "123456789");
+    }
+
+    #[test]
+    fn auth_credentials_none_on_no_match() {
+        let buf = b"nothing interesting in here at all";
+        assert_eq!(scan_auth_credentials(buf), None);
+    }
+
+    #[test]
+    fn steam_id_finds_value_past_false_starts() {
+        // Leading 's' bytes are false starts for the old byte-at-a-time scanner.
+        let buf = b"ssssssssteamId=steamId=76561198012345678";
+        let sid = scan_steam_id(buf).expect("should find steam id");
+        assert_eq!(sid, "76561198012345678");
+    }
+
+    #[test]
+    fn steam_id_none_on_no_match() {
+        let buf = b"steamId=short";
+        assert_eq!(scan_steam_id(buf), None);
     }
 }
 
