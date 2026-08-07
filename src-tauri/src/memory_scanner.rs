@@ -459,6 +459,10 @@ fn scan_linux_credential_regions(
     // it would cost hundreds of megabytes of copies per scan.
     const MAX_REGION: usize = 128 * 1024 * 1024;
 
+    // Deliberately not routed through `walk_regions`: that chunks at 64 MiB,
+    // which would split the 64–128 MiB mappings this accepts into two reads and
+    // hand `scan_auth_credentials` and `scan_steam_id` a boundary they could
+    // lose a match across. Reading each accepted region whole is the point here.
     let mut buffer = Vec::new();
     for region in regions {
         if region.executable || region.len > MAX_REGION {
@@ -497,9 +501,14 @@ pub fn scan_warframe_credentials_process() -> Result<(String, String, String), S
 /// Hand every mapping `accept` selects to `visit` in chunks, lowest address
 /// first. Callers differ in what they want — inventory data, code, or both —
 /// so the filter is theirs to supply rather than a flag this has to interpret.
+///
+/// Takes an already-open process and an already-discovered region list so the
+/// inventory scan, which already holds both, is not forced to reopen
+/// `/proc/pid/mem` and re-read `/proc/pid/maps` just to get at the read loop.
 #[cfg(target_os = "linux")]
-fn walk_linux_regions(
-    pid: u32,
+fn walk_regions(
+    process: &LinuxProcess,
+    regions: impl IntoIterator<Item = LinuxRegion>,
     accept: impl Fn(&LinuxRegion) -> bool,
     deadline: std::time::Instant,
     mut visit: impl FnMut(usize, &[u8]) -> bool,
@@ -508,9 +517,6 @@ fn walk_linux_regions(
     // multi-gigabyte arena cannot blow up the heap.
     const CHUNK: usize = 64 * 1024 * 1024;
     const MIN_USEFUL: usize = 8;
-
-    let process = LinuxProcess::open(pid)?;
-    let regions = linux_process_regions(pid)?;
 
     let mut buffer = Vec::new();
     for region in regions {
@@ -537,6 +543,22 @@ fn walk_linux_regions(
         }
     }
     Ok(())
+}
+
+/// Open the process and discover its regions, then delegate to
+/// [`walk_regions`]. The one-shot diagnostic tools below only ever walk once,
+/// so they keep this single-call shape rather than plumbing a `LinuxProcess`
+/// and `Vec<LinuxRegion>` through themselves.
+#[cfg(target_os = "linux")]
+fn walk_linux_regions(
+    pid: u32,
+    accept: impl Fn(&LinuxRegion) -> bool,
+    deadline: std::time::Instant,
+    visit: impl FnMut(usize, &[u8]) -> bool,
+) -> Result<(), String> {
+    let process = LinuxProcess::open(pid)?;
+    let regions = linux_process_regions(pid)?;
+    walk_regions(&process, regions, accept, deadline, visit)
 }
 
 /// Read a single byte from the game process, used for the riven validity flag.
@@ -1755,6 +1777,10 @@ fn scan_linux_inventory_regions(
     const MAX_READ: usize = 64 * 1024 * 1024;
     const MAX_SCAN: usize = 20 * 1024 * 1024;
     const PREFIX_BYTES: usize = 8 * 1024 * 1024;
+    // A monitor tick, not a one-shot command, but walk_regions still needs a
+    // bound; a full walk finishes in low single-digit seconds, so this is
+    // never the reason a scan ends.
+    const TIMEOUT: u64 = 600;
 
     struct ActiveScan {
         data: Vec<u8>,
@@ -1778,42 +1804,32 @@ fn scan_linux_inventory_regions(
     let mut bytes_read: u64 = 0;
     let mut t_read = std::time::Duration::ZERO;
     let mut t_search = std::time::Duration::ZERO;
-    // Printed once regardless of which exit point below is taken, so the
-    // caller (or a `false` from `on_blob`) always leaves a timing trail.
-    let summarize = |regions_visited: usize,
-                     bytes_read: u64,
-                     t_read: std::time::Duration,
-                     t_search: std::time::Duration| {
-        eprintln!(
-            "[blob-scan] done: regions={} bytes={}MB read={:.0}ms search={:.0}ms total={:.0}ms",
-            regions_visited, bytes_read / 1_000_000,
-            t_read.as_secs_f64() * 1000.0, t_search.as_secs_f64() * 1000.0,
-            t_total.elapsed().as_secs_f64() * 1000.0,
-        );
-    };
 
     let mut scans: Vec<ActiveScan> = Vec::new();
     let mut prefix = std::collections::VecDeque::<PrefixChunk>::new();
-    let mut buffer = Vec::new();
-    for region in regions {
-        if region.executable || region.len < MIN_REGION {
-            continue;
-        }
+    let mut outcome = None;
+    // walk_regions owns the read call now, so it cannot be timed directly;
+    // the gap between one visit call returning and the next one starting is
+    // exactly the next read's duration, which is the same quantity the old
+    // inline loop measured by wrapping `process.read` itself.
+    let mut last_visit = std::time::Instant::now();
 
-        buffer.resize(region.len.min(MAX_READ), 0);
-        // Timed before the match so that rejected reads still count: a walk that
-        // spends its time on mappings ptrace refuses would otherwise report
-        // read=0ms against a large total.
-        let t0 = std::time::Instant::now();
-        let attempt = process.read(region.start, &mut buffer);
-        t_read += t0.elapsed();
-        let read = match attempt {
-            Ok(read) if read >= 8 => read,
-            Ok(_) | Err(_) => continue,
-        };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT);
+    // Reproduces the old per-region truncation (a region past MAX_READ was
+    // never fully read) rather than letting walk_regions chunk through the
+    // whole mapping — that coverage gap is a separate, deliberate follow-up.
+    let capped_regions = regions
+        .into_iter()
+        .map(|region| LinuxRegion { len: region.len.min(MAX_READ), ..region });
+
+    // `return` inside this closure exits only the closure, matching the early
+    // returns the pre-split loop body took from the function itself. Split
+    // out of the `visit` closure passed below so the read-timer wrapping it
+    // measures only the read, not this bookkeeping.
+    let mut process_chunk = |address: usize, chunk: &[u8]| -> bool {
         regions_visited += 1;
-        bytes_read += read as u64;
-        let chunk = &buffer[..read];
+        bytes_read += chunk.len() as u64;
+        let read = chunk.len();
 
         let mut index = 0;
         while index < scans.len() {
@@ -1850,13 +1866,13 @@ fn scan_linux_inventory_regions(
             if !save && blob_unchanged(&scan.data) {
                 eprintln!("[blob] scan unchanged since last scan — skipping parse");
                 LAST_BLOB_REGION.store(scan.start_address as u64, std::sync::atomic::Ordering::Relaxed);
-                summarize(regions_visited, bytes_read, t_read, t_search);
-                return true;
+                outcome = Some(true);
+                return false;
             }
             match parse_full_account_blob(&scan.data) {
                 Some(inventory) => {
                     if !on_blob(scan.start_address, &scan.data, inventory) {
-                        summarize(regions_visited, bytes_read, t_read, t_search);
+                        outcome = Some(false);
                         return false;
                     }
                 }
@@ -1883,21 +1899,21 @@ fn scan_linux_inventory_regions(
                 prefix.pop_front();
             }
             prefix.push_back(PrefixChunk {
-                start: region.start,
-                end: region.start + read,
+                start: address,
+                end: address + read,
                 data: chunk.to_vec(),
             });
         }
         if is_mission {
-            continue;
+            return true;
         }
         let Some(_) = start_offset else {
-            continue;
+            return true;
         };
 
         let mut combined = Vec::new();
-        let mut combined_start = region.start;
-        let mut expected_end = region.start;
+        let mut combined_start = address;
+        let mut expected_end = address;
         let mut chain = Vec::new();
         for (index, item) in prefix.iter().enumerate().rev() {
             if item.end <= expected_end && item.end + 4096 >= expected_end {
@@ -1925,13 +1941,13 @@ fn scan_linux_inventory_regions(
             if !save && blob_unchanged(&seed) {
                 eprintln!("[blob] immediate seed unchanged since last scan — skipping parse");
                 LAST_BLOB_REGION.store(start_address as u64, std::sync::atomic::Ordering::Relaxed);
-                summarize(regions_visited, bytes_read, t_read, t_search);
-                return true;
+                outcome = Some(true);
+                return false;
             }
             match parse_full_account_blob(&seed) {
                 Some(inventory) => {
                     if !on_blob(start_address, &seed, inventory) {
-                        summarize(regions_visited, bytes_read, t_read, t_search);
+                        outcome = Some(false);
                         return false;
                     }
                 }
@@ -1945,9 +1961,31 @@ fn scan_linux_inventory_regions(
                 end_seen: false,
             });
         }
-    }
-    summarize(regions_visited, bytes_read, t_read, t_search);
-    false
+        true
+    };
+
+    let _ = walk_regions(
+        process,
+        capped_regions,
+        |region| !region.executable && region.len >= MIN_REGION,
+        deadline,
+        |address, chunk| {
+            t_read += last_visit.elapsed();
+            let keep_going = process_chunk(address, chunk);
+            last_visit = std::time::Instant::now();
+            keep_going
+        },
+    );
+
+    // Printed once regardless of which path above set `outcome`, so the
+    // caller always leaves a timing trail.
+    eprintln!(
+        "[blob-scan] done: regions={} bytes={}MB read={:.0}ms search={:.0}ms total={:.0}ms",
+        regions_visited, bytes_read / 1_000_000,
+        t_read.as_secs_f64() * 1000.0, t_search.as_secs_f64() * 1000.0,
+        t_total.elapsed().as_secs_f64() * 1000.0,
+    );
+    outcome.unwrap_or(false)
 }
 
 /// Outcome of probing the cached region address: either the bytes changed and
@@ -1970,6 +2008,14 @@ enum CachedBlobScan {
 ///
 /// Returns `None` whenever anything looks different from last time, which puts
 /// the caller back on the full walk rather than reporting a stale inventory.
+///
+/// Both reads below stay hand-rolled rather than routed through
+/// `walk_regions`: the first reads from `cached`, an address partway into a
+/// mapping rather than a region start, and the stitch loop below caps each
+/// read to the *remaining* `MAX_SCAN` budget, which shrinks as `data` grows.
+/// `walk_regions` chunks at a fixed 64 MiB regardless of caller state, so
+/// routing the stitch loop through it would let a single read overrun a
+/// near-exhausted budget by tens of megabytes on this scan's hot path.
 #[cfg(target_os = "linux")]
 fn scan_linux_cached_blob(
     process: &LinuxProcess,
