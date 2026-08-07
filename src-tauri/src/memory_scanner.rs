@@ -1770,6 +1770,10 @@ static END_FINDER: LazyLock<memmem::Finder<'static>> =
 #[cfg(target_os = "linux")]
 static MISSION_FINDER: LazyLock<memmem::Finder<'static>> =
     LazyLock::new(|| memmem::Finder::new(b"\"InventoryChanges\":".as_slice()));
+// Shared by both the cold walk and the cached-region fast path so a scan
+// dropped for growing past this cap means the same thing in either place.
+#[cfg(target_os = "linux")]
+const MAX_SCAN: usize = 20 * 1024 * 1024;
 
 /// Returns true when the walk stopped on a blob whose bytes were unchanged.
 /// That path reaches no `on_blob` call, so a caller counting blobs by the
@@ -1785,7 +1789,6 @@ fn scan_linux_inventory_regions(
     mut on_blob: impl FnMut(usize, &[u8], BlobInventory) -> bool,
 ) -> bool {
     const MIN_REGION: usize = 64_000;
-    const MAX_SCAN: usize = 20 * 1024 * 1024;
     const PREFIX_BYTES: usize = 8 * 1024 * 1024;
     // A monitor tick, not a one-shot command, but walk_regions still needs a
     // bound; a full walk finishes in low single-digit seconds, so this is
@@ -1902,6 +1905,10 @@ fn scan_linux_inventory_regions(
         let is_mission = (has_prefix || start_offset.is_some())
             && MISSION_FINDER.find(chunk).is_some();
         t_search += t1.elapsed();
+        // ponytail: the chain-reconstruction below assumes every mapping in
+        // `prefix` precedes `chunk` in address order, which only holds because
+        // the caller walks regions ascending. A descending walk would need two
+        // ascending passes over a candidate list, not a `.rev()` of this one.
         if start_offset.is_none() && !is_mission && has_prefix {
             while prefix.iter().map(|item| item.data.len()).sum::<usize>() + read > PREFIX_BYTES
                 && !prefix.is_empty()
@@ -2055,9 +2062,6 @@ fn scan_linux_cached_blob(
     process: &LinuxProcess,
     regions: &[LinuxRegion],
 ) -> Option<CachedBlobScan> {
-    const MAX_SCAN: usize = 20 * 1024 * 1024;
-    const START_MARKER: &[u8] = b"\"SubscribedToEmails\"";
-
     let cached = LAST_BLOB_REGION.load(std::sync::atomic::Ordering::Relaxed) as usize;
     if cached == 0 {
         return None;
