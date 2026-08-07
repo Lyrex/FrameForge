@@ -1706,6 +1706,25 @@ fn scan_linux_inventory_regions(
         data: Vec<u8>,
     }
 
+    let t_total = std::time::Instant::now();
+    let mut regions_visited = 0usize;
+    let mut bytes_read: u64 = 0;
+    let mut t_read = std::time::Duration::ZERO;
+    let mut t_search = std::time::Duration::ZERO;
+    // Printed once regardless of which exit point below is taken, so the
+    // caller (or a `false` from `on_blob`) always leaves a timing trail.
+    let summarize = |regions_visited: usize,
+                     bytes_read: u64,
+                     t_read: std::time::Duration,
+                     t_search: std::time::Duration| {
+        eprintln!(
+            "[blob-scan] done: regions={} bytes={}MB read={:.0}ms search={:.0}ms total={:.0}ms",
+            regions_visited, bytes_read / 1_000_000,
+            t_read.as_secs_f64() * 1000.0, t_search.as_secs_f64() * 1000.0,
+            t_total.elapsed().as_secs_f64() * 1000.0,
+        );
+    };
+
     let mut scans: Vec<ActiveScan> = Vec::new();
     let mut prefix = std::collections::VecDeque::<PrefixChunk>::new();
     for region in regions {
@@ -1714,10 +1733,18 @@ fn scan_linux_inventory_regions(
         }
 
         let mut buffer = vec![0; region.len.min(MAX_READ)];
-        let read = match process.read(region.start, &mut buffer) {
+        // Timed before the match so that rejected reads still count: a walk that
+        // spends its time on mappings ptrace refuses would otherwise report
+        // read=0ms against a large total.
+        let t0 = std::time::Instant::now();
+        let attempt = process.read(region.start, &mut buffer);
+        t_read += t0.elapsed();
+        let read = match attempt {
             Ok(read) if read >= 8 => read,
             Ok(_) | Err(_) => continue,
         };
+        regions_visited += 1;
+        bytes_read += read as u64;
         let chunk = &buffer[..read];
 
         let mut index = 0;
@@ -1744,11 +1771,13 @@ fn scan_linux_inventory_regions(
             let scan = scans.swap_remove(index);
             if let Some(inventory) = parse_full_account_blob(&scan.data) {
                 if !on_blob(scan.start_address, &scan.data, inventory) {
+                    summarize(regions_visited, bytes_read, t_read, t_search);
                     return;
                 }
             }
         }
 
+        let t1 = std::time::Instant::now();
         let mut is_mission = false;
         let mut start_offset = None;
         let mut has_prefix = false;
@@ -1759,6 +1788,7 @@ fn scan_linux_inventory_regions(
                 _ => has_prefix = true,
             }
         }
+        t_search += t1.elapsed();
         if start_offset.is_none() && !is_mission && has_prefix {
             while prefix.iter().map(|item| item.data.len()).sum::<usize>() + read > PREFIX_BYTES
                 && !prefix.is_empty()
@@ -1807,6 +1837,7 @@ fn scan_linux_inventory_regions(
         if find_blob_end(&seed).is_some() {
             if let Some(inventory) = parse_full_account_blob(&seed) {
                 if !on_blob(start_address, &seed, inventory) {
+                    summarize(regions_visited, bytes_read, t_read, t_search);
                     return;
                 }
             }
@@ -1818,6 +1849,7 @@ fn scan_linux_inventory_regions(
             });
         }
     }
+    summarize(regions_visited, bytes_read, t_read, t_search);
 }
 
 /// Re-read the blob straight from the address the last successful scan found it
@@ -1848,12 +1880,15 @@ fn scan_linux_cached_blob(
         .iter()
         .position(|region| cached >= region.start && cached < region.start + region.len)?;
 
+    let t_total = std::time::Instant::now();
+
     // The cached address is the blob's opening brace, so the seed starts there
     // and runs to the end of its mapping.
     let region = &regions[index];
     let mut data = vec![0; region.start + region.len - cached];
     let read = process.read(cached, &mut data).ok()?;
     data.truncate(read);
+    let mut bytes_read = read as u64;
     // The walk seeds either from the blob's opening brace or, when the brace
     // sits in an earlier mapping it could not stitch, from the start marker
     // itself. Accept both shapes and reject anything else as a stale address.
@@ -1872,6 +1907,7 @@ fn scan_linux_cached_blob(
     // Continue through the following mappings exactly as the full walk does:
     // the blob regularly spans several of them, and gaps between mappings do
     // not interrupt the JSON.
+    let t_stitch = std::time::Instant::now();
     let mut next = index + 1;
     while find_blob_end(&data).is_none() {
         if data.len() >= MAX_SCAN {
@@ -1885,9 +1921,21 @@ fn scan_linux_cached_blob(
         let mut buffer = vec![0; region.len.min(MAX_SCAN - data.len())];
         let read = process.read(region.start, &mut buffer).ok()?;
         data.extend_from_slice(&buffer[..read]);
+        bytes_read += read as u64;
     }
+    let stitch_time = t_stitch.elapsed();
 
-    parse_full_account_blob(&data).map(|inventory| (cached, data, inventory))
+    let t_parse = std::time::Instant::now();
+    let result = parse_full_account_blob(&data).map(|inventory| (cached, data, inventory));
+    let parse_time = t_parse.elapsed();
+    if result.is_some() {
+        eprintln!(
+            "[blob] cached-region stats: bytes={}KB stitch={:.1}ms parse={:.1}ms total={:.1}ms",
+            bytes_read / 1000, stitch_time.as_secs_f64() * 1000.0,
+            parse_time.as_secs_f64() * 1000.0, t_total.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+    result
 }
 
 #[cfg(target_os = "linux")]
