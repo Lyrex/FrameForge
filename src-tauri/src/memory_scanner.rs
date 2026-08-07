@@ -385,10 +385,10 @@ pub fn dump_inventory_regions(_max_hits: usize) -> Vec<String> {
 /// the `}` that immediately follows its boolean value (true or false).
 fn find_blob_end(raw: &[u8]) -> Option<usize> {
     const KEY: &[u8] = b"\"DeathSquadable\":";
-    let key_pos = raw.windows(KEY.len()).position(|w| w == KEY)?;
+    let key_pos = memmem::find(raw, KEY)?;
     let after   = key_pos + KEY.len();
     // Skip the boolean value and find the closing brace
-    let brace = raw[after..].iter().position(|&b| b == b'}')?;
+    let brace = memchr::memchr(b'}', &raw[after..])?;
     Some(after + brace + 1)
 }
 
@@ -422,10 +422,8 @@ fn enclosing_object_start(buf: &[u8], marker_off: usize) -> Option<usize> {
 ///   - `marker_off`: byte position of the first known start marker
 ///   - `json_open`:  byte position of the outermost `{` enclosing the marker
 fn blob_seed_offsets(buf: &[u8]) -> (usize, usize) {
-    let marker_off = buf.windows(START_MARKER.len())
-        .position(|w| w == START_MARKER)
-        .or_else(|| ALT_STARTS.iter().find_map(|a|
-            buf.windows(a.len()).position(|w| w == *a)))
+    let marker_off = memmem::find(buf, START_MARKER)
+        .or_else(|| ALT_STARTS.iter().find_map(|a| memmem::find(buf, a)))
         .unwrap_or(buf.len().saturating_sub(1));
     let json_open = enclosing_object_start(buf, marker_off).unwrap_or(marker_off);
     (marker_off, json_open)
@@ -499,8 +497,7 @@ pub fn extract_blob_json(raw: &[u8]) -> Option<Vec<u8>> {
     if raw.first() == Some(&b'{') {
         Some(raw[..end_pos].to_vec())
     } else {
-        const START: &[u8] = b"\"SubscribedToEmails\"";
-        let start_pos = raw.windows(START.len()).position(|w| w == START)?;
+        let start_pos = memmem::find(raw, START_MARKER)?;
         let mut v = Vec::with_capacity(end_pos - start_pos + 1);
         v.push(b'{');
         v.extend_from_slice(&raw[start_pos..end_pos]);
@@ -1403,7 +1400,8 @@ mod seed_tests {
         let buf = b"{\"SubscribedToEmails\":1,\"RegularCredits\":100}";
         let (marker_off, json_open) = blob_seed_offsets(buf);
         assert_eq!(json_open, 0);
-        assert!(marker_off > 0);
+        // Both markers are present; the primary one must win over the alt-start.
+        assert_eq!(marker_off, 1);
     }
 
     #[test]
@@ -1433,6 +1431,18 @@ mod seed_tests {
 
         let json = extract_blob_json(&raw).expect("end marker present");
         assert_eq!(json.len(), blob_len);
+        assert!(serde_json::from_slice::<serde_json::Value>(&json).is_ok());
+    }
+
+    #[test]
+    fn blob_json_reinstates_the_opening_brace_when_it_was_overwritten() {
+        let mut raw = br#"x"SubscribedToEmails":0,"DeathSquadable":false}"#.to_vec();
+        let blob_len = raw.len();
+        raw.extend(std::iter::repeat(0xABu8).take(1024));
+
+        let json = extract_blob_json(&raw).expect("end marker present");
+        assert_eq!(json.len(), blob_len);
+        assert_eq!(json[0], b'{');
         assert!(serde_json::from_slice::<serde_json::Value>(&json).is_ok());
     }
 }
