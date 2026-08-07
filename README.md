@@ -1,4 +1,4 @@
-# FrameForge — Warframe Companion `v2.9.0-linux.4`
+# FrameForge — Warframe Companion `v3.0.0-linux.1`
 
 A desktop companion for Warframe — live inventory, market prices, trading, timers, relic overlay, and riven analysis. Read-only, no game modification.
 
@@ -27,8 +27,12 @@ Reads your inventory directly from Warframe's process memory (read-only, same AP
 
 This gives complete coverage: resources, mods, arcanes, relics, weapons, Warframes, companions, blueprints, cosmetics (glyphs, palettes, emotes, titles, ship skins), sigils, pending Foundry jobs, credits, and more. Items that leave your inventory (traded, consumed, or expired) are correctly detected as dropped to zero. Inventory is persisted to disk and restored instantly on next launch — no login required.
 
+**View modes** — Cards (icon + text), Icon grid, Text cards, List with icon, or Compact list (text-only, maximum density). Persisted per tab.
+
 ### Foundry
 Browse every craftable item with full ingredient trees. Components are colour-coded by ownership status and show which relics drop them. Star items to track them in the Modular Window. Filter by Prime, Vaulted/Unvaulted, Owned/Unowned, Ready to build, and Mastered/Unmastered.
+
+**View modes** — switch between Cards (icon + text), Icon grid, Text cards, List (compact row with icon), and Compact list (text-only) via the toggle in the filter bar. Each tab remembers its own preference.
 
 ### Market Helper
 Browse Prime sets and mods with live platinum prices from [warframe.market](https://warframe.market). Prices are loaded from the [FrameForgePricing](https://github.com/WyrmStudios/FrameForgePricing) mirror on startup — a daily bulk cache updated twice per day from relics.run. No per-item network calls needed. Click any item for a live order popup with sell/buy orders, 3-week price chart, and one-click listing (requires WFM login). Mod cards show per-rank chips — click a chip to pre-fill the listing form with that exact rank and quantity. A **rank selector** in the orders popup filters listings to a specific mod/arcane rank.
@@ -51,7 +55,9 @@ Full warframe.market integration — manage active listings, post new orders, an
 - **In-app WFM login** — authenticate via a built-in WebView browser popup instead of entering credentials manually.
 
 ### Relic Helper
-Browse void fissure drop tables with rarity colour-coding, ownership status, and platinum values. Supports all refinement levels (Intact → Radiant).
+Browse void fissure drop tables with rarity colour-coding, ownership status, and platinum values. Supports all refinement levels (Intact → Radiant). View modes apply here too.
+
+**Relic Planner** — EV (expected value) calculator per refinement tier. Pick your metric (Platinum or Ducats), squad size (Solo → 4-player radshare), and filter by era, owned, or vaulted. Sortable columns: click any header (Relic, Owned, Intact, Except., Flawless, Radiant, Refine gain) to sort ascending or descending.
 
 ### Timers
 Live dashboard from DE's worldstate API:
@@ -79,7 +85,7 @@ The item catalog used for OCR matching is built exclusively from known relic rew
 Customisable sidebar with reorderable sections: tracked crafting items, favourite inventory items, pinned timers, and watched fissures.
 
 ### Settings
-Reorganised into a tabbed sidebar layout: **General** (overlay, scanner, API, account info, pop-out), **Market** (WFM status automation), **Accessibility** (colorblind mode, text size), **Data** (item database, cache), and **Debugging** (loggers, diagnostic tools with folder access and one-click clear).
+Reorganised into a tabbed sidebar layout: **General** (overlay, scanner, API, account info, pop-out), **Market** (WFM status automation), **Accessibility** (colorblind mode, text size up to 200%), **Data** (item database, cache), and **Debugging** (loggers, diagnostic tools with folder access and one-click clear).
 
 ---
 
