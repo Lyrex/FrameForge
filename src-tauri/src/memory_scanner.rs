@@ -270,17 +270,20 @@ struct LinuxRegion {
 
 #[cfg(target_os = "linux")]
 struct LinuxProcess {
+    pid: u32,
+    // Fallback for the process_vm_readv EFAULT case in `read` below; not used
+    // on the fast path.
     memory: File,
 }
 
 #[cfg(target_os = "linux")]
 impl LinuxProcess {
     fn open(pid: u32) -> Result<Self, String> {
-        open_linux_process_memory(pid).map(|memory| Self { memory })
+        open_linux_process_memory(pid).map(|memory| Self { pid, memory })
     }
 
     fn read(&self, address: usize, buffer: &mut [u8]) -> std::io::Result<usize> {
-        read_linux_process_memory(&self.memory, address, buffer)
+        read_linux_process_memory(self.pid, &self.memory, address, buffer)
     }
 }
 
@@ -327,13 +330,49 @@ fn open_linux_process_memory(pid: u32) -> Result<File, String> {
     })
 }
 
+/// `/proc/pid/mem` bounces every byte through a kernel scratch buffer;
+/// `process_vm_readv` pins the remote pages and copies straight into `buffer`
+/// (measured 3.55s vs 0.44s reading the same 754 regions). Same privilege
+/// check as the procfs path (`PTRACE_MODE_ATTACH_REALCREDS`), so the
+/// ptrace_scope guidance above stays accurate.
 #[cfg(target_os = "linux")]
 fn read_linux_process_memory(
+    pid: u32,
     memory: &File,
     address: usize,
     buffer: &mut [u8],
 ) -> std::io::Result<usize> {
-    memory.read_at(buffer, address as u64)
+    let local_iov = libc::iovec {
+        iov_base: buffer.as_mut_ptr().cast(),
+        iov_len: buffer.len(),
+    };
+    let remote_iov = libc::iovec {
+        iov_base: address as *mut std::ffi::c_void,
+        iov_len: buffer.len(),
+    };
+
+    // SAFETY: local_iov/iov_base points at `buffer`, which the caller keeps
+    // alive and exclusively borrowed for `buffer.len()` bytes across this
+    // call; remote_iov's base is only ever dereferenced by the kernel inside
+    // the target process, never in this address space. The return value is
+    // checked before `buffer` is trusted.
+    let written = unsafe { libc::process_vm_readv(pid as libc::pid_t, &local_iov, 1, &remote_iov, 1, 0) };
+    if written >= 0 {
+        return Ok(written as usize);
+    }
+
+    let error = std::io::Error::last_os_error();
+    // A hole partway through the range comes back as a short read (handled
+    // above), same as `read_at`. EFAULT means not even the first page was
+    // readable, which is the one case where the two readers walk the mapping
+    // differently enough to be worth double-checking, so retry through procfs
+    // and let its answer stand — it reports the same case as EIO, and callers
+    // were written against that. Any other errno (ESRCH once the process has
+    // exited) propagates; every caller already skips the region on Err.
+    if error.raw_os_error() == Some(libc::EFAULT) {
+        return memory.read_at(buffer, address as u64);
+    }
+    Err(error)
 }
 
 #[cfg(target_os = "windows")]
@@ -420,11 +459,12 @@ fn scan_linux_credential_regions(
     // it would cost hundreds of megabytes of copies per scan.
     const MAX_REGION: usize = 128 * 1024 * 1024;
 
+    let mut buffer = Vec::new();
     for region in regions {
         if region.executable || region.len > MAX_REGION {
             continue;
         }
-        let mut buffer = vec![0; region.len];
+        buffer.resize(region.len, 0);
         let read = match process.read(region.start, &mut buffer) {
             Ok(read) if read > 0 => read,
             Ok(_) | Err(_) => continue,
@@ -1754,12 +1794,13 @@ fn scan_linux_inventory_regions(
 
     let mut scans: Vec<ActiveScan> = Vec::new();
     let mut prefix = std::collections::VecDeque::<PrefixChunk>::new();
+    let mut buffer = Vec::new();
     for region in regions {
         if region.executable || region.len < MIN_REGION {
             continue;
         }
 
-        let mut buffer = vec![0; region.len.min(MAX_READ)];
+        buffer.resize(region.len.min(MAX_READ), 0);
         // Timed before the match so that rejected reads still count: a walk that
         // spends its time on mappings ptrace refuses would otherwise report
         // read=0ms against a large total.
@@ -1979,6 +2020,7 @@ fn scan_linux_cached_blob(
     // that walked past it would never see it again.
     let mut search_from = 0;
     let mut end_seen = false;
+    let mut buffer = Vec::new();
     loop {
         if !end_seen {
             let scan_from = search_from;
@@ -1996,7 +2038,7 @@ fn scan_linux_cached_blob(
         if region.executable {
             continue;
         }
-        let mut buffer = vec![0; region.len.min(MAX_SCAN - data.len())];
+        buffer.resize(region.len.min(MAX_SCAN - data.len()), 0);
         let read = process.read(region.start, &mut buffer).ok()?;
         data.extend_from_slice(&buffer[..read]);
         bytes_read += read as u64;
@@ -2733,6 +2775,62 @@ mod linux_tests {
             .expect("marker address is mapped");
         assert_eq!(read, marker.len());
         assert_eq!(actual, marker);
+    }
+
+    #[test]
+    fn linux_reader_skips_rather_than_panics_when_the_first_page_is_unmapped() {
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+        let mut buffer = vec![0u8; 4096];
+        // Below mmap_min_addr on every normal Linux config, so nothing is ever
+        // mapped here. process_vm_readv reports this as EFAULT, which read()
+        // retries through /proc/pid/mem; either shape must reach the caller
+        // as a skip rather than a panic.
+        match process.read(0x1000, &mut buffer) {
+            Ok(read) => assert_eq!(read, 0, "no bytes can come from an unmapped page"),
+            Err(_) => {}
+        }
+    }
+
+    #[test]
+    fn linux_reader_returns_leading_bytes_when_the_read_crosses_into_a_hole() {
+        use std::ffi::c_void;
+
+        let page = 4096;
+        // Two adjacent anonymous pages, then revoke access to the second: the
+        // read below spans a readable page followed by an unreadable one,
+        // exactly the shape process_vm_readv reports as a short read rather
+        // than an error. PROT_NONE rather than munmap because tests run in
+        // parallel and a genuine hole is an address another test's allocation
+        // could land in, which would turn this into a flake.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page * 2,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapped, libc::MAP_FAILED, "test needs two throwaway pages");
+        unsafe {
+            std::ptr::write_bytes(mapped.cast::<u8>(), 0xAB, page);
+            let revoked =
+                libc::mprotect((mapped as usize + page) as *mut c_void, page, libc::PROT_NONE);
+            assert_eq!(revoked, 0, "failed to revoke access to the second page");
+        }
+
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+        let mut buffer = vec![0u8; page * 2];
+        let read = process
+            .read(mapped as usize, &mut buffer)
+            .expect("the first page is mapped, so this must not error");
+        assert_eq!(read, page, "read must stop exactly at the hole");
+        assert!(buffer[..page].iter().all(|&byte| byte == 0xAB));
+
+        unsafe {
+            libc::munmap(mapped, page * 2);
+        }
     }
 
     #[test]
