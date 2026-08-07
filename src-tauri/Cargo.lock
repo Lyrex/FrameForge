@@ -4841,7 +4841,6 @@ dependencies = [
 name = "warframe-companion"
 version = "3.0.0-linux.1"
 dependencies = [
- "aho-corasick",
  "chrono",
  "dirs 5.0.1",
  "libc",
