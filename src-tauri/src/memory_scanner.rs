@@ -75,7 +75,6 @@ pub struct PendingRecipe {
 }
 
 /// One Archon Shard socketed into a Warframe.
-/// One Archon Shard socketed into a Warframe.
 /// `upgrade_type` is the effect path (e.g. `.../ArchonCrystalUpgradeWarframeEnergyMax`).
 /// `color` is the raw string value from the JSON (e.g. `"ACC_CRIMSON"`, `"ACC_AZURE_TAUFORGED"`).
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -159,37 +158,6 @@ pub fn xp_to_rank(xp: i64, path: &str) -> u32 {
     { 1000.0f64 } else { 500.0f64 };
     ((xp as f64 / base).sqrt().floor() as u32).min(30)
 }
-
-/// Diagnostic: find "CompletionDate" in any format and return a snippet of context.
-#[allow(dead_code)]
-pub fn scan_completion_date_context(data: &[u8]) -> Vec<String> {
-    let key = b"\"CompletionDate\"";
-    let mut results = Vec::new();
-    let mut start = 0usize;
-    loop {
-        let next = match data[start..].iter().position(|&b| b == b'"') {
-            Some(p) => start + p,
-            None => break,
-        };
-        if next + key.len() > data.len() { break; }
-        if data[next..next + key.len()] != *key {
-            start = next + 1; continue;
-        }
-        // Capture 120 bytes of context starting 40 bytes before the key
-        let ctx_start = next.saturating_sub(40);
-        let ctx_end   = (next + 120).min(data.len());
-        let ctx = &data[ctx_start..ctx_end];
-        // Only include printable ASCII so the log is readable
-        let s: String = ctx.iter()
-            .map(|&b| if b >= 0x20 && b < 0x7f { b as char } else { '·' })
-            .collect();
-        results.push(s);
-        start = next + key.len();
-        if results.len() >= 3 { break; } // cap at 3 samples
-    }
-    results
-}
-
 
 // ─── Auth credentials scan ───────────────────────────────────────────────────
 //
@@ -432,96 +400,6 @@ pub fn dump_inventory_regions(_max_hits: usize) -> Vec<String> {
     vec!["Only supported on Windows".to_string()]
 }
 
-// ─── One-shot inventory blob capture ─────────────────────────────────────────
-//
-// Scans all committed readable regions for the first chunk that contains the
-// inventory root marker ("MiscItems":[).  Saves the full printable-text portion
-// of that region to `output_path` so it can be inspected offline.
-//
-// Non-printable bytes are replaced with '.' so the file is text-editor friendly.
-// Saves up to 8 MB centred on the MiscItems key (4 MB before, 4 MB after).
-
-#[cfg(target_os = "windows")]
-pub fn capture_inventory_blob(output_path: &std::path::Path) -> Result<String, String> {
-    use std::ffi::c_void;
-    use std::mem;
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, FALSE},
-        System::{
-            Diagnostics::Debug::ReadProcessMemory,
-            Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS},
-            Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
-        },
-    };
-
-    let pid = find_warframe_pid_pub().ok_or_else(|| "Warframe is not running".to_string())?;
-
-    let process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid) };
-    if process == 0 { return Err("Could not open Warframe process".to_string()); }
-
-    const MISC_KEY: &[u8]      = b"\"MiscItems\":[";
-    const MIN_BLOB_BYTES: usize = 200_000;    // skip tiny chunks — real inventory is MB-scale
-    const MAX_REGION_READ: usize = 128 * 1024 * 1024;
-    const HALF_SAVE: usize      = 4 * 1024 * 1024;   // 4 MB either side of MiscItems
-
-    let mut addr: usize = 0;
-    let mut saved: Option<(usize, String)> = None; // (region size, message)
-
-    'outer: loop {
-        let mut mbi = unsafe { mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
-        if unsafe { VirtualQueryEx(process, addr as *const c_void, &mut mbi, mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 { break; }
-
-        let region_addr = mbi.BaseAddress as usize;
-        let region_size = mbi.RegionSize;
-        let next_addr   = region_addr.saturating_add(region_size);
-
-        if mbi.State == MEM_COMMIT
-            && mbi.Protect & PAGE_GUARD    == 0
-            && mbi.Protect & PAGE_NOACCESS == 0
-            && region_size >= MIN_BLOB_BYTES
-            && region_size <= MAX_REGION_READ
-        {
-            let mut data = vec![0u8; region_size];
-            let mut n = 0usize;
-            if unsafe { ReadProcessMemory(process, region_addr as *const c_void, data.as_mut_ptr() as *mut c_void, region_size, &mut n) } != 0 && n >= MIN_BLOB_BYTES {
-                let data = &data[..n];
-                if let Some(misc_pos) = data.windows(MISC_KEY.len()).position(|w| w == MISC_KEY) {
-                    let start = misc_pos.saturating_sub(HALF_SAVE);
-                    let end   = (misc_pos + HALF_SAVE).min(data.len());
-                    let text: Vec<u8> = data[start..end].iter()
-                        .map(|&b| if b >= 0x20 && b <= 0x7e || b == b'\n' || b == b'\t' { b } else { b'.' })
-                        .collect();
-                    if let Err(e) = std::fs::write(output_path, &text) {
-                        unsafe { CloseHandle(process); }
-                        return Err(format!("Write failed: {e}"));
-                    }
-                    saved = Some((text.len(), format!(
-                        "Saved {}KB blob (region 0x{:x}, size {}KB, MiscItems at +{}KB) to {}",
-                        text.len() / 1024, region_addr, n / 1024, misc_pos / 1024,
-                        output_path.display()
-                    )));
-                    break 'outer;
-                }
-            }
-        }
-
-        if next_addr <= addr { break; }
-        addr = next_addr;
-    }
-
-    unsafe { CloseHandle(process); }
-
-    saved.map(|(_, msg)| msg)
-         .ok_or_else(|| "No inventory blob found — make sure Warframe is running and inventory is loaded (open Arsenal or Inventory screen)".to_string())
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn capture_inventory_blob(_output_path: &std::path::Path) -> Result<String, String> {
-    Err("Only supported on Windows".into())
-}
-
-/// Scan all Warframe process memory and save every relevant blob found into `blob_dir`.
-/// "Relevant" = region ≥ 100 KB that contains at least one of: MiscItems, Suits,
 // ─── Full-account blob parser ─────────────────────────────────────────────────
 
 /// Find the end of the FULL_ACCOUNT blob by locating `"DeathSquadable":` and

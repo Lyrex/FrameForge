@@ -4264,14 +4264,6 @@ async fn dump_memory_probe(state: State<'_, AppState>) -> Result<String, String>
     Ok(output)
 }
 
-/// Toggle the continuous raw memory string-dump.
-/// One-shot manual capture of the full inventory JSON blob.
-#[tauri::command]
-fn capture_inventory_blob(state: State<'_, AppState>) -> Result<String, String> {
-    let path = state.raw_scan_path.with_file_name("inventory_blob.txt");
-    memory_scanner::capture_inventory_blob(&path)
-}
-
 /// Enable or disable automatic per-pass inventory blob logging to blobs/.
 #[tauri::command]
 fn set_blob_log(enabled: bool, state: State<'_, AppState>) {
@@ -8535,7 +8527,6 @@ pub fn run() {
             log_api_changes,
             dump_memory_probe,
             toggle_raw_scan,
-            capture_inventory_blob,
             set_blob_log,
             set_api_log,
             get_app_version,
