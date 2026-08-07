@@ -1774,7 +1774,6 @@ fn scan_linux_inventory_regions(
     mut on_blob: impl FnMut(usize, &[u8], BlobInventory) -> bool,
 ) -> bool {
     const MIN_REGION: usize = 64_000;
-    const MAX_READ: usize = 64 * 1024 * 1024;
     const MAX_SCAN: usize = 20 * 1024 * 1024;
     const PREFIX_BYTES: usize = 8 * 1024 * 1024;
     // A monitor tick, not a one-shot command, but walk_regions still needs a
@@ -1815,12 +1814,6 @@ fn scan_linux_inventory_regions(
     let mut last_visit = std::time::Instant::now();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT);
-    // Reproduces the old per-region truncation (a region past MAX_READ was
-    // never fully read) rather than letting walk_regions chunk through the
-    // whole mapping — that coverage gap is a separate, deliberate follow-up.
-    let capped_regions = regions
-        .into_iter()
-        .map(|region| LinuxRegion { len: region.len.min(MAX_READ), ..region });
 
     // `return` inside this closure exits only the closure, matching the early
     // returns the pre-split loop body took from the function itself. Split
@@ -1966,7 +1959,7 @@ fn scan_linux_inventory_regions(
 
     let _ = walk_regions(
         process,
-        capped_regions,
+        regions,
         |region| !region.executable && region.len >= MIN_REGION,
         deadline,
         |address, chunk| {
@@ -3246,6 +3239,86 @@ mod linux_tests {
         });
 
         assert_eq!(inventory.expect("inventory blob is found").credits, 42);
+    }
+
+    /// Regression test for the pre-cap that shrank `regions` to `MAX_READ`
+    /// before `walk_regions` could chunk it, silently dropping everything
+    /// past the first 64 MiB of a large mapping.
+    #[test]
+    fn linux_inventory_scan_finds_blob_past_first_chunk_boundary() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_last_blob_region();
+
+        let mut blob = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#.to_vec();
+        blob.resize(64_000, b' ');
+        blob.extend_from_slice(br#""DeathSquadable":false}"#);
+        blob.resize(128_000, 0);
+
+        const CHUNK: usize = 64 * 1024 * 1024;
+        let blob_offset = CHUNK + 1024;
+        let mut arena = vec![0u8; blob_offset + blob.len()];
+        arena[blob_offset..blob_offset + blob.len()].copy_from_slice(&blob);
+
+        let regions = vec![LinuxRegion {
+            start: arena.as_ptr() as usize,
+            len: arena.len(),
+            executable: false,
+        }];
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+        let mut inventory = None;
+
+        scan_linux_inventory_regions(&process, regions, false, |_, _, parsed| {
+            inventory = Some(parsed);
+            false
+        });
+
+        assert_eq!(
+            inventory.expect("blob past the first 64 MiB chunk must still be found").credits,
+            42
+        );
+        reset_last_blob_region();
+    }
+
+    /// The harder cousin of the test above: the blob physically spans the
+    /// 64 MiB chunk seam. The start marker sits in the first chunk (opening an
+    /// `ActiveScan`) while the end marker and closing brace land in the second,
+    /// so the seed opened in chunk A must be stitched to chunk B to parse. The
+    /// old pre-cap dropped chunk B entirely, losing every straddling blob.
+    #[test]
+    fn linux_inventory_scan_finds_blob_straddling_chunk_boundary() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_last_blob_region();
+
+        let mut blob = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#.to_vec();
+        blob.resize(64_000, b' ');
+        blob.extend_from_slice(br#""DeathSquadable":false}"#);
+        blob.resize(128_000, 0);
+
+        const CHUNK: usize = 64 * 1024 * 1024;
+        // Start marker a few KiB before the seam; end marker (~offset 64 000)
+        // well past it, so the blob body crosses the A/B boundary.
+        let blob_offset = CHUNK - 8192;
+        let mut arena = vec![0u8; blob_offset + blob.len()];
+        arena[blob_offset..blob_offset + blob.len()].copy_from_slice(&blob);
+
+        let regions = vec![LinuxRegion {
+            start: arena.as_ptr() as usize,
+            len: arena.len(),
+            executable: false,
+        }];
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+        let mut inventory = None;
+
+        scan_linux_inventory_regions(&process, regions, false, |_, _, parsed| {
+            inventory = Some(parsed);
+            false
+        });
+
+        assert_eq!(
+            inventory.expect("blob straddling the 64 MiB seam must be stitched and found").credits,
+            42
+        );
+        reset_last_blob_region();
     }
 
     #[test]
