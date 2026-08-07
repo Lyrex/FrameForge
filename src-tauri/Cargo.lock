@@ -4839,7 +4839,7 @@ dependencies = [
 
 [[package]]
 name = "warframe-companion"
-version = "2.9.0-linux.3"
+version = "2.9.0-linux.4"
 dependencies = [
  "aho-corasick",
  "chrono",
