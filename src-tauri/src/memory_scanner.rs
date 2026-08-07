@@ -793,19 +793,16 @@ pub fn dump_inventory_regions(max_hits: usize) -> Vec<String> {
     let mut results: Vec<String> = Vec::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let walk = walk_linux_regions(pid, |region| !region.executable, deadline, |address, data| {
+        // Stop the walk as soon as the cap is reached rather than searching
+        // every remaining region for a hit we would only discard.
+        if results.len() >= max_hits {
+            return false;
+        }
         for needle in NEEDLES {
-            let mut search = 0;
-            for _ in 0..HITS_PER_NEEDLE {
+            for position in memmem::find_iter(data, needle).take(HITS_PER_NEEDLE) {
                 if results.len() >= max_hits {
                     return false;
                 }
-                let Some(relative) = data[search..]
-                    .windows(needle.len())
-                    .position(|window| window == *needle)
-                else {
-                    break;
-                };
-                let position = search + relative;
                 let context_start = position.saturating_sub(80);
                 let context_end = data.len().min(position + 200);
                 let snippet: String = data[context_start..context_end]
@@ -818,7 +815,6 @@ pub fn dump_inventory_regions(max_hits: usize) -> Vec<String> {
                     String::from_utf8_lossy(needle),
                     snippet
                 ));
-                search = position + needle.len();
             }
         }
         true
@@ -859,14 +855,7 @@ pub fn scan_api_url_strings() -> Result<Vec<String>, String> {
 
     walk_linux_regions(pid, |region| !region.executable, deadline, |_, data| {
         for needle in NEEDLES {
-            let mut search = 0;
-            while let Some(relative) = data[search..]
-                .windows(needle.len())
-                .position(|window| window == *needle)
-            {
-                let position = search + relative;
-                search = position + needle.len();
-
+            for position in memmem::find_iter(data, needle) {
                 let start = position.saturating_sub(30);
                 let end = (position + 100).min(data.len());
                 let context: String = data[start..end]
@@ -2564,9 +2553,13 @@ pub fn find_riven_validity_va(pid: u32) -> Option<usize> {
         |region| region.executable && span.contains(&region.start),
         deadline,
         |address, data| {
-            for index in 0..data.len().saturating_sub(STORE_LEN + COMPARE.len()) {
-                if data[index..index + STORE.len()] != STORE {
-                    continue;
+            // STORE has no self-border (no proper suffix of it is also a
+            // prefix), so a match can never start inside a previous match's
+            // span; find_iter's non-overlapping search cannot skip a real hit.
+            let limit = data.len().saturating_sub(STORE_LEN + COMPARE.len());
+            for index in memmem::find_iter(data, &STORE) {
+                if index >= limit {
+                    break;
                 }
                 if data[index + STORE_LEN..index + STORE_LEN + COMPARE.len()] != COMPARE {
                     continue;
