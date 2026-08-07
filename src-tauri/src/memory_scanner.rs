@@ -1,5 +1,6 @@
 ﻿use memchr::memmem;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -493,15 +494,30 @@ pub fn compute_riven_mod_name(buffs: &[BlobRivenStat]) -> String {
 /// final region — potentially tens of megabytes of noise. This trims to just
 /// the valid JSON object so both the parser and the debug dump files see clean data.
 pub fn extract_blob_json(raw: &[u8]) -> Option<Vec<u8>> {
+    extract_blob_json_ref(raw).map(Cow::into_owned)
+}
+
+/// Borrowing counterpart of [`extract_blob_json`]. The common case (buffer still
+/// starts with the original `{`) needs no copy at all; only the fallback path,
+/// where the opening brace was overwritten in memory and has to be reinstated,
+/// allocates.
+pub fn extract_blob_json_ref(raw: &[u8]) -> Option<Cow<'_, [u8]>> {
     let end_pos = find_blob_end(raw)?;
+    extract_blob_json_at(raw, end_pos)
+}
+
+/// Same as [`extract_blob_json_ref`] but takes an already-known `end_pos`, so
+/// callers that located the blob end for their own purposes (e.g. the
+/// minimum-size check in [`parse_full_account_blob`]) don't pay for a second scan.
+fn extract_blob_json_at(raw: &[u8], end_pos: usize) -> Option<Cow<'_, [u8]>> {
     if raw.first() == Some(&b'{') {
-        Some(raw[..end_pos].to_vec())
+        Some(Cow::Borrowed(&raw[..end_pos]))
     } else {
         let start_pos = memmem::find(raw, START_MARKER)?;
         let mut v = Vec::with_capacity(end_pos - start_pos + 1);
         v.push(b'{');
         v.extend_from_slice(&raw[start_pos..end_pos]);
-        Some(v)
+        Some(Cow::Owned(v))
     }
 }
 
@@ -518,7 +534,7 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
         return None;
     }
 
-    let json_bytes = extract_blob_json(raw)?;
+    let json_bytes = extract_blob_json_at(raw, end_pos)?;
 
     let json: serde_json::Value = serde_json::from_slice(&json_bytes)
         .map_err(|e| {
@@ -1440,7 +1456,8 @@ fn find_warframe_pid() -> Option<u32> {
 
 #[cfg(test)]
 mod seed_tests {
-    use super::{enclosing_object_start, blob_seed_offsets, extract_blob_json};
+    use super::{enclosing_object_start, blob_seed_offsets, extract_blob_json, extract_blob_json_ref};
+    use std::borrow::Cow;
 
     #[test]
     fn enclosing_finds_outer_brace() {
@@ -1514,6 +1531,15 @@ mod seed_tests {
         assert_eq!(json.len(), blob_len);
         assert_eq!(json[0], b'{');
         assert!(serde_json::from_slice::<serde_json::Value>(&json).is_ok());
+    }
+
+    #[test]
+    fn blob_json_ref_borrows_in_the_common_case_and_owns_in_the_fallback() {
+        let intact = br#"{"SubscribedToEmails":0,"DeathSquadable":false}"#;
+        assert!(matches!(extract_blob_json_ref(intact), Some(Cow::Borrowed(_))));
+
+        let overwritten = br#"x"SubscribedToEmails":0,"DeathSquadable":false}"#;
+        assert!(matches!(extract_blob_json_ref(overwritten), Some(Cow::Owned(_))));
     }
 }
 
