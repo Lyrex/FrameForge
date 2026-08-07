@@ -1698,12 +1698,19 @@ static END_FINDER: LazyLock<memmem::Finder<'static>> =
 static MISSION_FINDER: LazyLock<memmem::Finder<'static>> =
     LazyLock::new(|| memmem::Finder::new(b"\"InventoryChanges\":".as_slice()));
 
+/// Returns true when the walk stopped on a blob whose bytes were unchanged.
+/// That path reaches no `on_blob` call, so a caller counting blobs by the
+/// callback would otherwise conclude the walk found nothing at all.
 #[cfg(target_os = "linux")]
 fn scan_linux_inventory_regions(
     process: &LinuxProcess,
     regions: impl IntoIterator<Item = LinuxRegion>,
+    // Saving blobs is a debugging path that wants every copy in memory even
+    // when byte-identical to the last scan, mirroring the `!save` gate on the
+    // Windows digest checks.
+    save: bool,
     mut on_blob: impl FnMut(usize, &[u8], BlobInventory) -> bool,
-) {
+) -> bool {
     const MIN_REGION: usize = 64_000;
     const MAX_READ: usize = 64 * 1024 * 1024;
     const MAX_SCAN: usize = 20 * 1024 * 1024;
@@ -1787,11 +1794,20 @@ fn scan_linux_inventory_regions(
             }
 
             let scan = scans.swap_remove(index);
-            if let Some(inventory) = parse_full_account_blob(&scan.data) {
-                if !on_blob(scan.start_address, &scan.data, inventory) {
-                    summarize(regions_visited, bytes_read, t_read, t_search);
-                    return;
+            if !save && blob_unchanged(&scan.data) {
+                eprintln!("[blob] scan unchanged since last scan — skipping parse");
+                LAST_BLOB_REGION.store(scan.start_address as u64, std::sync::atomic::Ordering::Relaxed);
+                summarize(regions_visited, bytes_read, t_read, t_search);
+                return true;
+            }
+            match parse_full_account_blob(&scan.data) {
+                Some(inventory) => {
+                    if !on_blob(scan.start_address, &scan.data, inventory) {
+                        summarize(regions_visited, bytes_read, t_read, t_search);
+                        return false;
+                    }
                 }
+                None => forget_blob_digest(),
             }
         }
 
@@ -1853,11 +1869,20 @@ fn scan_linux_inventory_regions(
         let seed = combined[json_open..].to_vec();
 
         if find_blob_end(&seed).is_some() {
-            if let Some(inventory) = parse_full_account_blob(&seed) {
-                if !on_blob(start_address, &seed, inventory) {
-                    summarize(regions_visited, bytes_read, t_read, t_search);
-                    return;
+            if !save && blob_unchanged(&seed) {
+                eprintln!("[blob] immediate seed unchanged since last scan — skipping parse");
+                LAST_BLOB_REGION.store(start_address as u64, std::sync::atomic::Ordering::Relaxed);
+                summarize(regions_visited, bytes_read, t_read, t_search);
+                return true;
+            }
+            match parse_full_account_blob(&seed) {
+                Some(inventory) => {
+                    if !on_blob(start_address, &seed, inventory) {
+                        summarize(regions_visited, bytes_read, t_read, t_search);
+                        return false;
+                    }
                 }
+                None => forget_blob_digest(),
             }
         } else {
             scans.push(ActiveScan {
@@ -1868,6 +1893,16 @@ fn scan_linux_inventory_regions(
         }
     }
     summarize(regions_visited, bytes_read, t_read, t_search);
+    false
+}
+
+/// Outcome of probing the cached region address: either the bytes changed and
+/// were reparsed, or they're identical to what the previous cycle already
+/// sent and there's nothing new to do.
+#[cfg(target_os = "linux")]
+enum CachedBlobScan {
+    Fresh(usize, BlobInventory),
+    Unchanged,
 }
 
 /// Re-read the blob straight from the address the last successful scan found it
@@ -1885,7 +1920,7 @@ fn scan_linux_inventory_regions(
 fn scan_linux_cached_blob(
     process: &LinuxProcess,
     regions: &[LinuxRegion],
-) -> Option<(usize, Vec<u8>, BlobInventory)> {
+) -> Option<CachedBlobScan> {
     const MAX_SCAN: usize = 20 * 1024 * 1024;
     const START_MARKER: &[u8] = b"\"SubscribedToEmails\"";
 
@@ -1955,17 +1990,35 @@ fn scan_linux_cached_blob(
     }
     let stitch_time = t_stitch.elapsed();
 
-    let t_parse = std::time::Instant::now();
-    let result = parse_full_account_blob(&data).map(|inventory| (cached, data, inventory));
-    let parse_time = t_parse.elapsed();
-    if result.is_some() {
+    // The bytes are known-good JSON at this point (find_blob_end succeeded), so
+    // this is the same "about to parse" instant the Windows fast path checks
+    // the digest at. A match means the previous cycle already parsed and sent
+    // this exact blob — skip the rebuild of BlobInventory's HashMaps/Vecs.
+    if blob_unchanged(&data) {
         eprintln!(
-            "[blob] cached-region stats: bytes={}KB stitch={:.1}ms parse={:.1}ms total={:.1}ms",
-            bytes_read / 1000, stitch_time.as_secs_f64() * 1000.0,
-            parse_time.as_secs_f64() * 1000.0, t_total.elapsed().as_secs_f64() * 1000.0,
+            "[blob] cached-region hit: unchanged since last scan — skipping parse (bytes={}KB stitch={:.1}ms total={:.1}ms)",
+            bytes_read / 1000, stitch_time.as_secs_f64() * 1000.0, t_total.elapsed().as_secs_f64() * 1000.0,
         );
+        return Some(CachedBlobScan::Unchanged);
     }
-    result
+
+    let t_parse = std::time::Instant::now();
+    let parsed = parse_full_account_blob(&data);
+    let parse_time = t_parse.elapsed();
+    match parsed {
+        Some(inventory) => {
+            eprintln!(
+                "[blob] cached-region stats: bytes={}KB stitch={:.1}ms parse={:.1}ms total={:.1}ms",
+                bytes_read / 1000, stitch_time.as_secs_f64() * 1000.0,
+                parse_time.as_secs_f64() * 1000.0, t_total.elapsed().as_secs_f64() * 1000.0,
+            );
+            Some(CachedBlobScan::Fresh(cached, inventory))
+        }
+        None => {
+            forget_blob_digest();
+            None
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1999,16 +2052,20 @@ pub fn capture_all_blobs(
     // Saving blobs is a debugging path that wants every copy in memory, so it
     // always takes the full walk.
     if !save {
-        if let Some((address, _, inventory)) = scan_linux_cached_blob(&process, &regions) {
-            eprintln!("[blob] Linux cached-region hit at 0x{address:012x}");
-            blob_tx.send(inventory).ok();
-            return 0;
+        match scan_linux_cached_blob(&process, &regions) {
+            Some(CachedBlobScan::Fresh(address, inventory)) => {
+                eprintln!("[blob] Linux cached-region hit at 0x{address:012x}");
+                blob_tx.send(inventory).ok();
+                return 0;
+            }
+            Some(CachedBlobScan::Unchanged) => return 0,
+            None => {} // cache miss — fall through to the full walk below
         }
     }
 
     let mut found = 0;
     let mut saved = 0;
-    scan_linux_inventory_regions(&process, regions, |address, raw, inventory| {
+    let unchanged = scan_linux_inventory_regions(&process, regions, save, |address, raw, inventory| {
         found += 1;
         eprintln!(
             "[blob] Linux scan SUCCESS at 0x{address:012x}: {} unique, {} stackable, {} mods",
@@ -2037,7 +2094,7 @@ pub fn capture_all_blobs(
         save && found < MAX_BLOBS
     });
 
-    if found == 0 {
+    if found == 0 && !unchanged {
         eprintln!(
             "[blob-capture] WARNING: no FULL_ACCOUNT blob found (open Arsenal or Inventory and try again)"
         );
@@ -2556,15 +2613,28 @@ mod seed_tests {
     }
 }
 
+// LAST_BLOB_REGION and LAST_BLOB_DIGEST are process-global statics shared by
+// every test in this binary. A bare reset-then-assert is enough isolation
+// when the calls in between are nanoseconds apart (no other thread gets a
+// window to interleave), but scan_linux_cached_blob and
+// scan_linux_inventory_regions do real /proc/pid/mem reads between touching
+// the digest — long enough for another test's own digest write to land in
+// the gap. Tests that call through those two functions take this lock so
+// only one of them touches the shared statics at a time.
+#[cfg(test)]
+static BLOB_DIGEST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod blob_digest_tests {
-    use super::{blob_unchanged, forget_blob_digest, reset_last_blob_region};
+    use super::{blob_unchanged, forget_blob_digest, reset_last_blob_region, BLOB_DIGEST_TEST_LOCK};
 
     // LAST_BLOB_DIGEST is a process-global static shared with every other
-    // test in this binary, so each case resets it first and runs its
-    // assertions in one #[test] rather than relying on test isolation.
+    // test in this binary, so each case takes BLOB_DIGEST_TEST_LOCK, resets
+    // the digest, and runs its assertions in one #[test] rather than relying
+    // on test isolation.
     #[test]
     fn digest_tracks_changes_and_resets() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_last_blob_region();
 
         let blob = b"{\"SubscribedToEmails\":1,\"RegularCredits\":100}".to_vec();
@@ -2585,6 +2655,7 @@ mod blob_digest_tests {
     // this", which would wedge the walk on a region that never parsed.
     #[test]
     fn forgetting_after_a_failed_parse_forces_a_retry() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_last_blob_region();
 
         let garbage = b"{\"MiscItems\":[ truncated".to_vec();
@@ -2653,6 +2724,7 @@ mod linux_tests {
 
     #[test]
     fn linux_cached_blob_is_reread_and_rejected_when_stale() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Blobs under 50 KB are rejected as coincidental fragments, so the
         // fixture pads the object out to a realistic size.
         let mut data = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#.to_vec();
@@ -2667,8 +2739,10 @@ mod linux_tests {
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
 
         LAST_BLOB_REGION.store(data.as_ptr() as u64, std::sync::atomic::Ordering::Relaxed);
-        let hit = scan_linux_cached_blob(&process, &regions);
-        assert_eq!(hit.expect("cached blob is re-read").2.credits, 42);
+        match scan_linux_cached_blob(&process, &regions).expect("cached blob is re-read") {
+            CachedBlobScan::Fresh(_, inventory) => assert_eq!(inventory.credits, 42),
+            CachedBlobScan::Unchanged => panic!("first sighting of this blob must parse"),
+        }
 
         // An address that no longer starts a blob must fall back to the walk
         // rather than reporting whatever happens to live there now.
@@ -2683,6 +2757,7 @@ mod linux_tests {
     /// boundary is still seen once the rest of it arrives in the next read.
     #[test]
     fn linux_cached_blob_finds_end_marker_split_across_mapping_boundary() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let marker = b"\"DeathSquadable\":";
         let (marker_head, marker_tail) = marker.split_at(7);
 
@@ -2703,8 +2778,10 @@ mod linux_tests {
         ];
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
         LAST_BLOB_REGION.store(base as u64, std::sync::atomic::Ordering::Relaxed);
-        let hit = scan_linux_cached_blob(&process, &regions);
-        assert_eq!(hit.expect("split marker is still found").2.credits, 42);
+        match scan_linux_cached_blob(&process, &regions).expect("split marker is still found") {
+            CachedBlobScan::Fresh(_, inventory) => assert_eq!(inventory.credits, 42),
+            CachedBlobScan::Unchanged => panic!("first sighting of this blob must parse"),
+        }
 
         reset_last_blob_region();
     }
@@ -2715,6 +2792,7 @@ mod linux_tests {
     /// keep remembering the marker it already passed.
     #[test]
     fn linux_cached_blob_keeps_stitching_when_end_brace_lands_in_next_mapping() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let marker = br#""DeathSquadable":"#;
 
         let mut first = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#.to_vec();
@@ -2734,8 +2812,50 @@ mod linux_tests {
         ];
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
         LAST_BLOB_REGION.store(base as u64, std::sync::atomic::Ordering::Relaxed);
-        let hit = scan_linux_cached_blob(&process, &regions);
-        assert_eq!(hit.expect("blob completed by the next mapping").2.credits, 42);
+        match scan_linux_cached_blob(&process, &regions).expect("blob completed by the next mapping") {
+            CachedBlobScan::Fresh(_, inventory) => assert_eq!(inventory.credits, 42),
+            CachedBlobScan::Unchanged => panic!("first sighting of this blob must parse"),
+        }
+
+        reset_last_blob_region();
+    }
+
+    #[test]
+    fn linux_cached_blob_skips_reparse_when_bytes_are_unchanged() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut data = br#"{"SubscribedToEmails":true,"RegularCredits":99,"MiscItems":[],"#.to_vec();
+        data.resize(64_000, b' ');
+        data.extend_from_slice(br#""DeathSquadable":false}"#);
+        data.resize(128_000, 0);
+        let regions = vec![LinuxRegion {
+            start: data.as_ptr() as usize,
+            len: data.len(),
+            executable: false,
+        }];
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+
+        reset_last_blob_region();
+        LAST_BLOB_REGION.store(data.as_ptr() as u64, std::sync::atomic::Ordering::Relaxed);
+        match scan_linux_cached_blob(&process, &regions).expect("first scan parses the blob") {
+            CachedBlobScan::Fresh(_, inventory) => assert_eq!(inventory.credits, 99),
+            CachedBlobScan::Unchanged => panic!("first sighting of this blob must parse"),
+        }
+
+        // Same address, same bytes: the digest recorded by the first call must
+        // suppress the reparse on the second.
+        match scan_linux_cached_blob(&process, &regions).expect("second scan still finds the region") {
+            CachedBlobScan::Unchanged => {}
+            CachedBlobScan::Fresh(..) => panic!("identical bytes must not be reparsed"),
+        }
+
+        // reset_last_blob_region clears the digest baseline along with the
+        // region cache, so the same bytes are treated as new again.
+        reset_last_blob_region();
+        LAST_BLOB_REGION.store(data.as_ptr() as u64, std::sync::atomic::Ordering::Relaxed);
+        match scan_linux_cached_blob(&process, &regions).expect("scan after reset parses again") {
+            CachedBlobScan::Fresh(_, inventory) => assert_eq!(inventory.credits, 99),
+            CachedBlobScan::Unchanged => panic!("reset must force a reparse"),
+        }
 
         reset_last_blob_region();
     }
@@ -2771,8 +2891,47 @@ mod linux_tests {
         );
     }
 
+    /// The walk reports an unchanged blob rather than calling `on_blob`, so the
+    /// caller must not read that as "nothing found" and warn the user that no
+    /// inventory is in memory.
+    #[test]
+    fn linux_inventory_scan_reports_unchanged_instead_of_reparsing() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_last_blob_region();
+
+        let mut mapping = br#"{"SubscribedToEmails":true,"RegularCredits":7,"MiscItems":[],"#.to_vec();
+        mapping.resize(64_000, b' ');
+        mapping.extend_from_slice(br#""DeathSquadable":false}"#);
+        mapping.resize(128_000, 0);
+        let regions = || {
+            vec![LinuxRegion {
+                start: mapping.as_ptr() as usize,
+                len: mapping.len(),
+                executable: false,
+            }]
+        };
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+
+        let mut inventory = None;
+        let unchanged = scan_linux_inventory_regions(&process, regions(), false, |_, _, parsed| {
+            inventory = Some(parsed);
+            false
+        });
+        assert!(!unchanged, "the first walk has no baseline to match");
+        assert_eq!(inventory.expect("inventory blob is found").credits, 7);
+
+        let unchanged = scan_linux_inventory_regions(&process, regions(), false, |_, _, _| {
+            panic!("identical bytes must not be reparsed")
+        });
+        assert!(unchanged, "the second walk must report the blob as unchanged");
+
+        reset_last_blob_region();
+    }
+
     #[test]
     fn linux_inventory_scan_stitches_and_parses_regions() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_last_blob_region();
         let first_json = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#;
         let second_json = br#""DeathSquadable":false}"#;
         let mut first = first_json.to_vec();
@@ -2794,7 +2953,7 @@ mod linux_tests {
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
         let mut inventory = None;
 
-        scan_linux_inventory_regions(&process, regions, |_, _, parsed| {
+        scan_linux_inventory_regions(&process, regions, false, |_, _, parsed| {
             inventory = Some(parsed);
             false
         });
@@ -2809,6 +2968,8 @@ mod linux_tests {
     /// ("expected value at line 1 column 9") and lost the inventory entirely.
     #[test]
     fn linux_inventory_scan_seeds_at_the_blob_not_at_earlier_json() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_last_blob_region();
         // Qualifies for the prefix buffer: Lotus path, no start marker, no
         // mission delta — and opens a JSON object of its own.
         let mut prefix = br#"{"Mods":garbage/Lotus/Weapons/Tenno/Rifle "#.to_vec();
@@ -2832,7 +2993,7 @@ mod linux_tests {
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
 
         let mut inventory = None;
-        scan_linux_inventory_regions(&process, regions, |_, _, parsed| {
+        scan_linux_inventory_regions(&process, regions, false, |_, _, parsed| {
             inventory = Some(parsed);
             false
         });
@@ -2842,6 +3003,8 @@ mod linux_tests {
 
     #[test]
     fn linux_inventory_scan_finishes_before_rejecting_large_mapping() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_last_blob_region();
         let first_json = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#;
         let second_json = br#""DeathSquadable":false}"#;
         let mut first = first_json.to_vec();
@@ -2863,7 +3026,7 @@ mod linux_tests {
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
         let mut inventory = None;
 
-        scan_linux_inventory_regions(&process, regions, |_, _, parsed| {
+        scan_linux_inventory_regions(&process, regions, false, |_, _, parsed| {
             inventory = Some(parsed);
             false
         });
@@ -2873,6 +3036,8 @@ mod linux_tests {
 
     #[test]
     fn linux_inventory_scan_recovers_fields_before_start_marker() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_last_blob_region();
         let prefix =
             br#"{"RegularCredits":42,"MiscItems":[{"ItemType":"/Lotus/Test","ItemCount":1}],"#;
         let suffix = br#""SubscribedToEmails":true,"DeathSquadable":false}"#;
@@ -2894,7 +3059,7 @@ mod linux_tests {
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
         let mut inventory = None;
 
-        scan_linux_inventory_regions(&process, regions, |_, _, parsed| {
+        scan_linux_inventory_regions(&process, regions, false, |_, _, parsed| {
             inventory = Some(parsed);
             false
         });
