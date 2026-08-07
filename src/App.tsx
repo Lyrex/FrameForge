@@ -4,6 +4,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { usePlatformCapabilities } from "./platform";
+import EeLogSettings from "./EeLogSettings";
 
 // ── Riven overlay — module-level window management ────────────────────────────
 // Stored OUTSIDE React so StrictMode remounts don't destroy/recreate the window.
@@ -2022,6 +2023,8 @@ if (typeof s.autoDiagEnabled === "boolean") {
                       </select>
                     </div>
                   </div>
+
+                  {platform.linux && <EeLogSettings />}
 
                   {/* Memory Scanner */}
                   <div className="settings-section" style={{ borderColor: memoryScannerEnabled ? "rgba(240,192,64,.3)" : undefined }}>

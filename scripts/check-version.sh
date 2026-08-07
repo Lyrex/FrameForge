@@ -26,6 +26,19 @@ if [ "$cargo_version" != "$package_version" ] || [ "$cargo_version" != "$tauri_v
     exit 1
 fi
 
+# Agreement alone would bless three files agreeing on garbage.
+scheme='[0-9]+\.[0-9]+\.[0-9]+-linux\.[0-9]+'
+if [[ ! "$cargo_version" =~ ^${scheme}$ ]]; then
+    echo "::error::'$cargo_version' does not look like <upstream>-linux.<n>"
+    exit 1
+fi
+
+readme_version=$(grep -m1 -oE "$scheme" "$root/README.md" || true)
+if [ "$readme_version" != "$cargo_version" ]; then
+    echo "::error::README says '$readme_version' but the tree is at $cargo_version"
+    exit 1
+fi
+
 if [ -n "$expected" ] && [ "$expected" != "$cargo_version" ]; then
     echo "::error::expected $expected but the tree is at $cargo_version"
     exit 1
