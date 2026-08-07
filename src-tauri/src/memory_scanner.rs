@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::FileExt;
+#[cfg(target_os = "linux")]
+use std::sync::LazyLock;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ModCount {
@@ -1657,6 +1659,45 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
     saved
 }
 
+// Warframe's address space is several gigabytes, and the naive
+// `windows().any()` form of these searches walks every byte position once per
+// marker — eight separate passes per region, which dominated the scan at
+// roughly 60 MiB/s. `LazyLock` compiles the automaton once instead of on
+// every call to the functions below.
+#[cfg(target_os = "linux")]
+static MARKERS: LazyLock<AhoCorasick> = LazyLock::new(|| {
+    AhoCorasick::new(
+        std::iter::once(b"\"SubscribedToEmails\"".as_slice())
+            .chain(std::iter::once(b"\"InventoryChanges\":".as_slice()))
+            .chain(
+                [
+                    b"/Lotus/".as_slice(),
+                    b"\"MiscItems\":[",
+                    b"\"Suits\":[",
+                    b"\"LongGuns\":[",
+                    b"\"Melee\":[",
+                    b"\"Pistols\":[",
+                ]
+                .into_iter(),
+            ),
+    )
+    .expect("marker set is a valid literal alternation")
+});
+#[cfg(target_os = "linux")]
+const START_PATTERN: usize = 0;
+#[cfg(target_os = "linux")]
+const MISSION_PATTERN: usize = 1;
+
+// Single-literal searches use `memmem::Finder` rather than a one-pattern
+// Aho-Corasick automaton — Aho-Corasick's construction overhead only pays for
+// itself with multiple patterns searched together.
+#[cfg(target_os = "linux")]
+static END_FINDER: LazyLock<memmem::Finder<'static>> =
+    LazyLock::new(|| memmem::Finder::new(b"\"DeathSquadable\":".as_slice()));
+#[cfg(target_os = "linux")]
+static MISSION_FINDER: LazyLock<memmem::Finder<'static>> =
+    LazyLock::new(|| memmem::Finder::new(b"\"InventoryChanges\":".as_slice()));
+
 #[cfg(target_os = "linux")]
 fn scan_linux_inventory_regions(
     process: &LinuxProcess,
@@ -1666,33 +1707,7 @@ fn scan_linux_inventory_regions(
     const MIN_REGION: usize = 64_000;
     const MAX_READ: usize = 64 * 1024 * 1024;
     const MAX_SCAN: usize = 20 * 1024 * 1024;
-    const START_MARKER: &[u8] = b"\"SubscribedToEmails\"";
-    const END_MARKER: &[u8] = b"\"DeathSquadable\":";
-    const MISSION_DELTA: &[u8] = b"\"InventoryChanges\":";
-    const PREFIX_MARKERS: &[&[u8]] = &[
-        b"/Lotus/",
-        b"\"MiscItems\":[",
-        b"\"Suits\":[",
-        b"\"LongGuns\":[",
-        b"\"Melee\":[",
-        b"\"Pistols\":[",
-    ];
     const PREFIX_BYTES: usize = 8 * 1024 * 1024;
-
-    // Warframe's address space is several gigabytes, and the naive
-    // `windows().any()` form of these searches walks every byte position once
-    // per marker — eight separate passes per region, which dominated the scan
-    // at roughly 60 MiB/s. One Aho-Corasick automaton answers all three
-    // questions in a single SIMD-accelerated pass instead.
-    let markers = AhoCorasick::new(
-        std::iter::once(START_MARKER)
-            .chain(std::iter::once(MISSION_DELTA))
-            .chain(PREFIX_MARKERS.iter().copied()),
-    )
-    .expect("marker set is a valid literal alternation");
-    const START_PATTERN: usize = 0;
-    const MISSION_PATTERN: usize = 1;
-    let end_marker = AhoCorasick::new([END_MARKER]).expect("end marker is a valid literal");
 
     struct ActiveScan {
         data: Vec<u8>,
@@ -1750,14 +1765,17 @@ fn scan_linux_inventory_regions(
         let mut index = 0;
         while index < scans.len() {
             let search_from = scans[index].search_from;
-            scans[index].search_from = scans[index].data.len().saturating_sub(END_MARKER.len() - 1);
+            scans[index].search_from = scans[index]
+                .data
+                .len()
+                .saturating_sub(END_FINDER.needle().len() - 1);
             let remaining = MAX_SCAN.saturating_sub(scans[index].data.len());
             let exceeds_limit = chunk.len() > remaining;
             scans[index]
                 .data
                 .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
 
-            let complete = end_marker.is_match(&scans[index].data[search_from..])
+            let complete = END_FINDER.find(&scans[index].data[search_from..]).is_some()
                 && find_blob_end(&scans[index].data).is_some();
             if !complete {
                 if exceeds_limit {
@@ -1781,7 +1799,7 @@ fn scan_linux_inventory_regions(
         let mut is_mission = false;
         let mut start_offset = None;
         let mut has_prefix = false;
-        for found in markers.find_iter(chunk) {
+        for found in MARKERS.find_iter(chunk) {
             match found.pattern().as_usize() {
                 MISSION_PATTERN => is_mission = true,
                 START_PATTERN => start_offset = start_offset.or(Some(found.start())),
@@ -1870,7 +1888,6 @@ fn scan_linux_cached_blob(
 ) -> Option<(usize, Vec<u8>, BlobInventory)> {
     const MAX_SCAN: usize = 20 * 1024 * 1024;
     const START_MARKER: &[u8] = b"\"SubscribedToEmails\"";
-    const MISSION_DELTA: &[u8] = b"\"InventoryChanges\":";
 
     let cached = LAST_BLOB_REGION.load(std::sync::atomic::Ordering::Relaxed) as usize;
     if cached == 0 {
@@ -1897,10 +1914,7 @@ fn scan_linux_cached_blob(
     }
     // A mission reward delta shares most of the blob's field names but describes
     // a single mission, so treating one as the inventory would wipe the cache.
-    if AhoCorasick::new([MISSION_DELTA])
-        .expect("mission marker is a valid literal")
-        .is_match(&data[..])
-    {
+    if MISSION_FINDER.find(&data[..]).is_some() {
         return None;
     }
 
