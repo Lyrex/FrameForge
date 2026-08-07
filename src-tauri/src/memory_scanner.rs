@@ -1720,6 +1720,11 @@ fn scan_linux_inventory_regions(
         data: Vec<u8>,
         start_address: usize,
         search_from: usize,
+        // Finding the marker is not finding the blob's end: find_blob_end also
+        // needs the closing brace, which can still be a mapping away. Once set,
+        // search_from stops advancing for this scan so a marker flush against a
+        // mapping edge isn't left behind the search window.
+        end_seen: bool,
     }
 
     struct PrefixChunk {
@@ -1771,19 +1776,26 @@ fn scan_linux_inventory_regions(
 
         let mut index = 0;
         while index < scans.len() {
-            let search_from = scans[index].search_from;
-            scans[index].search_from = scans[index]
-                .data
-                .len()
-                .saturating_sub(END_FINDER.needle().len() - 1);
             let remaining = MAX_SCAN.saturating_sub(scans[index].data.len());
             let exceeds_limit = chunk.len() > remaining;
-            scans[index]
-                .data
-                .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            if scans[index].end_seen {
+                scans[index]
+                    .data
+                    .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            } else {
+                let search_from = scans[index].search_from;
+                scans[index].search_from = scans[index]
+                    .data
+                    .len()
+                    .saturating_sub(END_FINDER.needle().len() - 1);
+                scans[index]
+                    .data
+                    .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                scans[index].end_seen =
+                    END_FINDER.find(&scans[index].data[search_from..]).is_some();
+            }
 
-            let complete = END_FINDER.find(&scans[index].data[search_from..]).is_some()
-                && find_blob_end(&scans[index].data).is_some();
+            let complete = scans[index].end_seen && find_blob_end(&scans[index].data).is_some();
             if !complete {
                 if exceeds_limit {
                     scans.swap_remove(index);
@@ -1889,6 +1901,7 @@ fn scan_linux_inventory_regions(
                 data: seed,
                 start_address,
                 search_from: 0,
+                end_seen: false,
             });
         }
     }
@@ -2999,6 +3012,63 @@ mod linux_tests {
         });
 
         assert_eq!(inventory.expect("inventory blob is found").credits, 42);
+    }
+
+    /// The cold walk juggles multiple concurrent `ActiveScan`s, each with its
+    /// own `search_from` cursor. When the end marker lands flush against a
+    /// mapping boundary, an unlatched cursor advances to just past the
+    /// marker's start on the next round rather than past the whole marker,
+    /// so a later re-search can miss it entirely once one more mapping goes
+    /// by without resolving the scan. Needs four mappings, not two: the
+    /// unlatched cursor lags one round behind and happens to paper over a
+    /// two-mapping gap, so a filler mapping is required to expose the loss.
+    #[test]
+    fn linux_inventory_scan_completes_when_marker_flush_at_mapping_edge() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_last_blob_region();
+
+        let marker = b"\"DeathSquadable\":";
+
+        let mut opening = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#.to_vec();
+        opening.resize(64_000, b' ');
+
+        let mut marker_flush = vec![b' '; 64_000 - marker.len()];
+        marker_flush.extend_from_slice(marker);
+
+        let filler = vec![b' '; 64_000];
+
+        let mut closing = b"false}".to_vec();
+        closing.resize(64_000, 0);
+
+        let mut arena = opening.clone();
+        arena.extend_from_slice(&marker_flush);
+        arena.extend_from_slice(&filler);
+        arena.extend_from_slice(&closing);
+        let base = arena.as_ptr() as usize;
+        let regions = vec![
+            LinuxRegion { start: base, len: opening.len(), executable: false },
+            LinuxRegion { start: base + opening.len(), len: marker_flush.len(), executable: false },
+            LinuxRegion {
+                start: base + opening.len() + marker_flush.len(),
+                len: filler.len(),
+                executable: false,
+            },
+            LinuxRegion {
+                start: base + opening.len() + marker_flush.len() + filler.len(),
+                len: closing.len(),
+                executable: false,
+            },
+        ];
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+
+        let mut inventory = None;
+        scan_linux_inventory_regions(&process, regions, false, |_, _, parsed| {
+            inventory = Some(parsed);
+            false
+        });
+
+        assert_eq!(inventory.expect("blob completed once brace lands").credits, 42);
+        reset_last_blob_region();
     }
 
     #[test]
