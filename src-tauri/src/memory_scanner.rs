@@ -1923,7 +1923,23 @@ fn scan_linux_cached_blob(
     // not interrupt the JSON.
     let t_stitch = std::time::Instant::now();
     let mut next = index + 1;
-    while find_blob_end(&data).is_none() {
+    // Mirrors the cursor in scan_linux_inventory_regions: only the
+    // newly-appended bytes are rescanned, backed off by one marker length so
+    // a copy split across a mapping boundary is still caught.
+    // Once the marker has been seen the cursor stops moving: the marker can sit
+    // flush against a boundary with its closing `}` still to come, and a cursor
+    // that walked past it would never see it again.
+    let mut search_from = 0;
+    let mut end_seen = false;
+    loop {
+        if !end_seen {
+            let scan_from = search_from;
+            search_from = data.len().saturating_sub(END_FINDER.needle().len() - 1);
+            end_seen = END_FINDER.find(&data[scan_from..]).is_some();
+        }
+        if end_seen && find_blob_end(&data).is_some() {
+            break;
+        }
         if data.len() >= MAX_SCAN {
             return None;
         }
@@ -2658,6 +2674,68 @@ mod linux_tests {
         // rather than reporting whatever happens to live there now.
         LAST_BLOB_REGION.store(data.as_ptr() as u64 + 8, std::sync::atomic::Ordering::Relaxed);
         assert!(scan_linux_cached_blob(&process, &regions).is_none());
+
+        reset_last_blob_region();
+    }
+
+    /// The warm-path stitch cursor backs off by `END_FINDER.needle().len() - 1`
+    /// bytes on each iteration precisely so a marker cut in half by a mapping
+    /// boundary is still seen once the rest of it arrives in the next read.
+    #[test]
+    fn linux_cached_blob_finds_end_marker_split_across_mapping_boundary() {
+        let marker = b"\"DeathSquadable\":";
+        let (marker_head, marker_tail) = marker.split_at(7);
+
+        let mut first = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#.to_vec();
+        first.resize(64_000 - marker_head.len(), b' ');
+        first.extend_from_slice(marker_head);
+
+        let mut second = marker_tail.to_vec();
+        second.extend_from_slice(b"false}");
+        second.resize(1024, 0);
+
+        let mut arena = first.clone();
+        arena.extend_from_slice(&second);
+        let base = arena.as_ptr() as usize;
+        let regions = vec![
+            LinuxRegion { start: base, len: first.len(), executable: false },
+            LinuxRegion { start: base + first.len(), len: second.len(), executable: false },
+        ];
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+        LAST_BLOB_REGION.store(base as u64, std::sync::atomic::Ordering::Relaxed);
+        let hit = scan_linux_cached_blob(&process, &regions);
+        assert_eq!(hit.expect("split marker is still found").2.credits, 42);
+
+        reset_last_blob_region();
+    }
+
+    /// Seeing the end marker is not the same as having the object's closing
+    /// brace: the marker can land flush against a mapping boundary with the
+    /// `}` only arriving in the next read. The stitch has to keep going, and
+    /// keep remembering the marker it already passed.
+    #[test]
+    fn linux_cached_blob_keeps_stitching_when_end_brace_lands_in_next_mapping() {
+        let marker = br#""DeathSquadable":"#;
+
+        let mut first = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#.to_vec();
+        first.resize(64_000 - marker.len() - 4, b' ');
+        first.extend_from_slice(marker);
+        first.extend_from_slice(b"fals");
+
+        let mut second = b"e}".to_vec();
+        second.resize(1024, 0);
+
+        let mut arena = first.clone();
+        arena.extend_from_slice(&second);
+        let base = arena.as_ptr() as usize;
+        let regions = vec![
+            LinuxRegion { start: base, len: first.len(), executable: false },
+            LinuxRegion { start: base + first.len(), len: second.len(), executable: false },
+        ];
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+        LAST_BLOB_REGION.store(base as u64, std::sync::atomic::Ordering::Relaxed);
+        let hit = scan_linux_cached_blob(&process, &regions);
+        assert_eq!(hit.expect("blob completed by the next mapping").2.credits, 42);
 
         reset_last_blob_region();
     }
