@@ -261,11 +261,33 @@ pub fn find_warframe_pid_pub() -> Option<u32> { find_warframe_pid() }
 pub fn find_warframe_pid_pub() -> Option<u32> { None }
 
 #[cfg(target_os = "linux")]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Default)]
 struct LinuxRegion {
     start: usize,
     len: usize,
     executable: bool,
+    // `/proc/pid/maps`'s 6th field: absent for anonymous mappings, a real
+    // path for file-backed ones, or a kernel pseudo-path like `[heap]`,
+    // `[stack]`, `[vvar]`, `[vsyscall]`.
+    path: Option<Box<str>>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxRegion {
+    /// `[heap]` and `[stack]` are anonymous in spirit — kernel-labeled
+    /// untagged memory, not a mapped file — and a 105 MB `[heap]` mapping is
+    /// exactly the shape a multi-megabyte JSON blob lives in, so both stay
+    /// first-pass candidates alongside true anonymous mappings. Other
+    /// bracketed pseudo-paths (`[vvar]`, `[vsyscall]`, ...) are kernel data
+    /// pages that can never hold heap JSON, so they are excluded from both
+    /// passes rather than falling through to the file-backed tier.
+    fn is_anonymous(&self) -> bool {
+        matches!(self.path.as_deref(), None | Some("[heap]") | Some("[stack]"))
+    }
+
+    fn is_file_backed(&self) -> bool {
+        matches!(self.path.as_deref(), Some(path) if !path.starts_with('['))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -299,10 +321,22 @@ fn parse_linux_maps(maps: &str) -> Vec<LinuxRegion> {
             }
             let start = usize::from_str_radix(start, 16).ok()?;
             let end = usize::from_str_radix(end, 16).ok()?;
+            // nth(3) skips offset, dev, inode to land on the pathname, which
+            // unlike every earlier field may contain spaces, so it is taken as
+            // the rest of the line rather than as a single token. The kernel's
+            // " (deleted)" suffix — how a Wine prefix updated under a running
+            // game shows up — is not part of the path and would otherwise
+            // defeat the `warframe.x64.exe` match in `linux_game_image_span`.
+            let path = fields.nth(3).map(|name| {
+                let offset = name.as_ptr() as usize - line.as_ptr() as usize;
+                let path = line[offset..].trim_end();
+                Box::from(path.strip_suffix(" (deleted)").unwrap_or(path))
+            });
             Some(LinuxRegion {
                 start,
                 len: end.checked_sub(start)?,
                 executable: permissions.as_bytes().get(2) == Some(&b'x'),
+                path,
             })
         })
         .collect()
@@ -1807,6 +1841,14 @@ fn scan_linux_inventory_regions(
     let mut scans: Vec<ActiveScan> = Vec::new();
     let mut prefix = std::collections::VecDeque::<PrefixChunk>::new();
     let mut outcome = None;
+    // Set as soon as anything blob-shaped turns up in the anonymous pass, so
+    // the file-backed fallback below is only ever taken when it truly found
+    // nothing — never when it merely stopped early on a full inventory. A
+    // `Cell` because `process_chunk` below needs to flip it from inside a
+    // closure that also has to be called again for the second pass, and an
+    // exclusive `&mut bool` capture would keep that closure's borrow alive
+    // across both calls, blocking the plain read between them.
+    let found_something = std::cell::Cell::new(false);
     // walk_regions owns the read call now, so it cannot be timed directly;
     // the gap between one visit call returning and the next one starting is
     // exactly the next read's duration, which is the same quantity the old
@@ -1860,10 +1902,12 @@ fn scan_linux_inventory_regions(
                 eprintln!("[blob] scan unchanged since last scan — skipping parse");
                 LAST_BLOB_REGION.store(scan.start_address as u64, std::sync::atomic::Ordering::Relaxed);
                 outcome = Some(true);
+                found_something.set(true);
                 return false;
             }
             match parse_full_account_blob(&scan.data) {
                 Some(inventory) => {
+                    found_something.set(true);
                     if !on_blob(scan.start_address, &scan.data, inventory) {
                         outcome = Some(false);
                         return false;
@@ -1935,10 +1979,12 @@ fn scan_linux_inventory_regions(
                 eprintln!("[blob] immediate seed unchanged since last scan — skipping parse");
                 LAST_BLOB_REGION.store(start_address as u64, std::sync::atomic::Ordering::Relaxed);
                 outcome = Some(true);
+                found_something.set(true);
                 return false;
             }
             match parse_full_account_blob(&seed) {
                 Some(inventory) => {
+                    found_something.set(true);
                     if !on_blob(start_address, &seed, inventory) {
                         outcome = Some(false);
                         return false;
@@ -1957,18 +2003,40 @@ fn scan_linux_inventory_regions(
         true
     };
 
-    let _ = walk_regions(
-        process,
-        regions,
-        |region| !region.executable && region.len >= MIN_REGION,
-        deadline,
-        |address, chunk| {
+    // File-backed mappings (PE data sections, fonts, shader caches, the whole
+    // Wine prefix's mapped files) hold no heap JSON in practice, so they are
+    // read only as a fallback: pass 1 walks the anonymous mappings, and pass
+    // 2 walks the file-backed remainder only if pass 1 turned up nothing.
+    // Worst case — an anonymous-first miss — reads exactly the set today's
+    // single-pass walk read; the typical case skips most of it. Windows
+    // takes the mirror-image shortcut in `capture_all_blobs` by rejecting
+    // `MEM_IMAGE` outright, since PE const-string sections false-trigger the
+    // Lotus anchor check there; Wine's heap being anonymous today is not a
+    // guarantee for every future Wine version, hence the fallback tier
+    // instead of dropping file-backed mappings outright.
+    let (anon_regions, file_regions): (Vec<LinuxRegion>, Vec<LinuxRegion>) = regions
+        .into_iter()
+        .filter(|region| {
+            !region.executable
+                && region.len >= MIN_REGION
+                && (region.is_anonymous() || region.is_file_backed())
+        })
+        .partition(LinuxRegion::is_anonymous);
+
+    let _ = walk_regions(process, anon_regions, |_| true, deadline, |address, chunk| {
+        t_read += last_visit.elapsed();
+        let keep_going = process_chunk(address, chunk);
+        last_visit = std::time::Instant::now();
+        keep_going
+    });
+    if !found_something.get() {
+        let _ = walk_regions(process, file_regions, |_| true, deadline, |address, chunk| {
             t_read += last_visit.elapsed();
             let keep_going = process_chunk(address, chunk);
             last_visit = std::time::Instant::now();
             keep_going
-        },
-    );
+        });
+    }
 
     // Printed once regardless of which path above set `outcome`, so the
     // caller always leaves a timing trail.
@@ -2446,26 +2514,22 @@ pub fn find_riven_validity_va(pid: u32) -> Option<usize> {
 /// and one data section keep the pathname, while `.text` becomes a large
 /// anonymous executable mapping wedged between them. So the module is
 /// identified by the span its named mappings bracket, not by file backing.
+///
+/// Takes the region list the caller already discovered rather than
+/// re-reading and re-parsing `/proc/pid/maps` by hand, now that `LinuxRegion`
+/// carries the pathname this needs.
 #[cfg(target_os = "linux")]
-fn linux_game_image_span(pid: u32) -> Option<std::ops::Range<usize>> {
-    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
-    let mut span: Option<std::ops::Range<usize>> = None;
-    for line in maps.lines() {
-        if !line.to_ascii_lowercase().ends_with("warframe.x64.exe") {
-            continue;
-        }
-        let mut fields = line.split_whitespace();
-        let (start, end) = fields.next()?.split_once('-')?;
-        let (start, end) = (
-            usize::from_str_radix(start, 16).ok()?,
-            usize::from_str_radix(end, 16).ok()?,
-        );
-        span = Some(match span {
-            Some(current) => current.start.min(start)..current.end.max(end),
-            None => start..end,
-        });
-    }
-    span
+fn linux_game_image_span(regions: &[LinuxRegion]) -> Option<std::ops::Range<usize>> {
+    regions
+        .iter()
+        .filter(|region| {
+            region
+                .path
+                .as_deref()
+                .is_some_and(|path| path.to_ascii_lowercase().ends_with("warframe.x64.exe"))
+        })
+        .map(|region| region.start..region.start + region.len)
+        .reduce(|span, next| span.start.min(next.start)..span.end.max(next.end))
 }
 
 /// Locate the byte the game sets while a riven reroll's A/B selection screen is
@@ -2500,14 +2564,19 @@ pub fn find_riven_validity_va(pid: u32) -> Option<usize> {
     // which is where the RIP-relative address is measured from.
     const STORE_LEN: usize = 7;
 
-    let span = linux_game_image_span(pid)?;
+    // Fetched once and handed to both the span lookup and the walk below,
+    // rather than each re-reading and re-parsing `/proc/pid/maps` on its own.
+    let regions = linux_process_regions(pid).ok()?;
+    let span = linux_game_image_span(&regions)?;
+    let process = LinuxProcess::open(pid).ok()?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut result = None;
 
     // The game's code is one mapping well under the walk's chunk size, so a
     // signature cannot be split across two chunks here.
-    let walk = walk_linux_regions(
-        pid,
+    let walk = walk_regions(
+        &process,
+        regions,
         |region| region.executable && span.contains(&region.start),
         deadline,
         |address, data| {
@@ -2884,8 +2953,7 @@ mod linux_tests {
         let regions = vec![LinuxRegion {
             start: data.as_ptr() as usize,
             len: data.len(),
-            executable: false,
-        }];
+            executable: false, ..Default::default() }];
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
 
         LAST_BLOB_REGION.store(data.as_ptr() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2923,8 +2991,8 @@ mod linux_tests {
         arena.extend_from_slice(&second);
         let base = arena.as_ptr() as usize;
         let regions = vec![
-            LinuxRegion { start: base, len: first.len(), executable: false },
-            LinuxRegion { start: base + first.len(), len: second.len(), executable: false },
+            LinuxRegion { start: base, len: first.len(), executable: false, ..Default::default() },
+            LinuxRegion { start: base + first.len(), len: second.len(), executable: false, ..Default::default() },
         ];
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
         LAST_BLOB_REGION.store(base as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2957,8 +3025,8 @@ mod linux_tests {
         arena.extend_from_slice(&second);
         let base = arena.as_ptr() as usize;
         let regions = vec![
-            LinuxRegion { start: base, len: first.len(), executable: false },
-            LinuxRegion { start: base + first.len(), len: second.len(), executable: false },
+            LinuxRegion { start: base, len: first.len(), executable: false, ..Default::default() },
+            LinuxRegion { start: base + first.len(), len: second.len(), executable: false, ..Default::default() },
         ];
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
         LAST_BLOB_REGION.store(base as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2980,8 +3048,7 @@ mod linux_tests {
         let regions = vec![LinuxRegion {
             start: data.as_ptr() as usize,
             len: data.len(),
-            executable: false,
-        }];
+            executable: false, ..Default::default() }];
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
 
         reset_last_blob_region();
@@ -3019,13 +3086,11 @@ mod linux_tests {
             LinuxRegion {
                 start: code.as_ptr() as usize,
                 len: code.len(),
-                executable: true,
-            },
+                executable: true, ..Default::default() },
             LinuxRegion {
                 start: data.as_ptr() as usize,
                 len: data.len(),
-                executable: false,
-            },
+                executable: false, ..Default::default() },
         ];
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
 
@@ -3057,8 +3122,7 @@ mod linux_tests {
             vec![LinuxRegion {
                 start: mapping.as_ptr() as usize,
                 len: mapping.len(),
-                executable: false,
-            }]
+                executable: false, ..Default::default() }]
         };
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
 
@@ -3078,6 +3142,92 @@ mod linux_tests {
         reset_last_blob_region();
     }
 
+    /// The safety valve this optimisation depends on: a blob living entirely
+    /// in a file-backed mapping (the only kind of mapping in this fixture)
+    /// must still be found, via the tier-2 fallback that runs when the
+    /// anonymous-only pass 1 comes up empty.
+    #[test]
+    fn linux_inventory_scan_finds_blob_via_file_backed_fallback() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_last_blob_region();
+
+        let mut blob = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#.to_vec();
+        blob.resize(64_000, b' ');
+        blob.extend_from_slice(br#""DeathSquadable":false}"#);
+        blob.resize(128_000, 0);
+
+        let regions = vec![LinuxRegion {
+            start: blob.as_ptr() as usize,
+            len: blob.len(),
+            executable: false,
+            path: Some("/usr/lib/warframe/data.pak".into()),
+        }];
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+        let mut inventory = None;
+
+        scan_linux_inventory_regions(&process, regions, false, |_, _, parsed| {
+            inventory = Some(parsed);
+            false
+        });
+
+        assert_eq!(
+            inventory
+                .expect("blob in a file-backed mapping is still found via the tier-2 fallback")
+                .credits,
+            42
+        );
+        reset_last_blob_region();
+    }
+
+    /// The other half of the safety valve: when the anonymous pass already
+    /// finds a blob, the file-backed mapping must never be read at all — not
+    /// just "not returned", genuinely untouched.
+    #[test]
+    fn linux_inventory_scan_skips_file_backed_tier_when_anonymous_pass_finds_a_blob() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_last_blob_region();
+
+        let mut anon_blob = br#"{"SubscribedToEmails":true,"RegularCredits":1,"MiscItems":[],"#.to_vec();
+        anon_blob.resize(64_000, b' ');
+        anon_blob.extend_from_slice(br#""DeathSquadable":false}"#);
+        anon_blob.resize(128_000, 0);
+
+        let mut file_blob = br#"{"SubscribedToEmails":true,"RegularCredits":2,"MiscItems":[],"#.to_vec();
+        file_blob.resize(64_000, b' ');
+        file_blob.extend_from_slice(br#""DeathSquadable":false}"#);
+        file_blob.resize(128_000, 0);
+
+        let regions = vec![
+            LinuxRegion {
+                start: anon_blob.as_ptr() as usize,
+                len: anon_blob.len(),
+                executable: false,
+                path: None,
+            },
+            LinuxRegion {
+                start: file_blob.as_ptr() as usize,
+                len: file_blob.len(),
+                executable: false,
+                path: Some("/usr/lib/warframe/data.pak".into()),
+            },
+        ];
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+
+        let mut found = Vec::new();
+        scan_linux_inventory_regions(&process, regions, false, |_, _, parsed| {
+            found.push(parsed.credits);
+            true
+        });
+
+        assert_eq!(
+            found,
+            vec![1],
+            "the file-backed blob must not be read once the anonymous pass already found one"
+        );
+
+        reset_last_blob_region();
+    }
+
     #[test]
     fn linux_inventory_scan_stitches_and_parses_regions() {
         let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3092,13 +3242,11 @@ mod linux_tests {
             LinuxRegion {
                 start: first.as_ptr() as usize,
                 len: first.len(),
-                executable: false,
-            },
+                executable: false, ..Default::default() },
             LinuxRegion {
                 start: second.as_ptr() as usize,
                 len: second.len(),
-                executable: false,
-            },
+                executable: false, ..Default::default() },
         ];
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
         let mut inventory = None;
@@ -3137,8 +3285,8 @@ mod linux_tests {
         arena.extend_from_slice(&blob);
         let base = arena.as_ptr() as usize;
         let regions = vec![
-            LinuxRegion { start: base, len: prefix.len(), executable: false },
-            LinuxRegion { start: base + prefix.len(), len: blob.len(), executable: false },
+            LinuxRegion { start: base, len: prefix.len(), executable: false, ..Default::default() },
+            LinuxRegion { start: base + prefix.len(), len: blob.len(), executable: false, ..Default::default() },
         ];
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
 
@@ -3183,18 +3331,16 @@ mod linux_tests {
         arena.extend_from_slice(&closing);
         let base = arena.as_ptr() as usize;
         let regions = vec![
-            LinuxRegion { start: base, len: opening.len(), executable: false },
-            LinuxRegion { start: base + opening.len(), len: marker_flush.len(), executable: false },
+            LinuxRegion { start: base, len: opening.len(), executable: false, ..Default::default() },
+            LinuxRegion { start: base + opening.len(), len: marker_flush.len(), executable: false, ..Default::default() },
             LinuxRegion {
                 start: base + opening.len() + marker_flush.len(),
                 len: filler.len(),
-                executable: false,
-            },
+                executable: false, ..Default::default() },
             LinuxRegion {
                 start: base + opening.len() + marker_flush.len() + filler.len(),
                 len: closing.len(),
-                executable: false,
-            },
+                executable: false, ..Default::default() },
         ];
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
 
@@ -3222,13 +3368,11 @@ mod linux_tests {
             LinuxRegion {
                 start: first.as_ptr() as usize,
                 len: first.len(),
-                executable: false,
-            },
+                executable: false, ..Default::default() },
             LinuxRegion {
                 start: second.as_ptr() as usize,
                 len: second.len(),
-                executable: false,
-            },
+                executable: false, ..Default::default() },
         ];
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
         let mut inventory = None;
@@ -3262,8 +3406,7 @@ mod linux_tests {
         let regions = vec![LinuxRegion {
             start: arena.as_ptr() as usize,
             len: arena.len(),
-            executable: false,
-        }];
+            executable: false, ..Default::default() }];
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
         let mut inventory = None;
 
@@ -3304,8 +3447,7 @@ mod linux_tests {
         let regions = vec![LinuxRegion {
             start: arena.as_ptr() as usize,
             len: arena.len(),
-            executable: false,
-        }];
+            executable: false, ..Default::default() }];
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
         let mut inventory = None;
 
@@ -3335,13 +3477,11 @@ mod linux_tests {
             LinuxRegion {
                 start: mapping.as_ptr() as usize,
                 len: 64_000,
-                executable: false,
-            },
+                executable: false, ..Default::default() },
             LinuxRegion {
                 start: mapping.as_ptr() as usize + 64_000,
                 len: 64_000,
-                executable: false,
-            },
+                executable: false, ..Default::default() },
         ];
         let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
         let mut inventory = None;
@@ -3366,14 +3506,72 @@ mod linux_tests {
                     start: 0x1000,
                     len: 0x1000,
                     executable: false,
+                    ..Default::default()
                 },
                 LinuxRegion {
                     start: 0x3000,
                     len: 0x2000,
                     executable: false,
+                    ..Default::default()
                 },
             ]
         );
+    }
+
+    /// `[heap]`/`[stack]` are labeled anonymous memory, not files, so they stay
+    /// first-pass candidates; `[vvar]`/`[vsyscall]` are kernel data pages that
+    /// hold no heap JSON and must be candidates in neither pass.
+    #[test]
+    fn classifies_pathnames_and_pseudo_paths() {
+        let maps = "\
+1000-2000 rw-p 0 00:00 0 \n\
+2000-3000 rw-p 0 00:00 0 [heap]\n\
+3000-4000 rw-p 0 00:00 0 [stack]\n\
+4000-5000 r--p 0 00:00 0 [vvar]\n\
+5000-6000 r--p 0 00:00 0 [vsyscall]\n\
+6000-7000 r--p 0 08:01 123 /usr/lib/warframe/Warframe.x64.exe\n";
+        let regions = parse_linux_maps(maps);
+
+        assert_eq!(regions[0].path, None);
+        assert!(regions[0].is_anonymous() && !regions[0].is_file_backed());
+
+        assert_eq!(regions[1].path.as_deref(), Some("[heap]"));
+        assert!(regions[1].is_anonymous() && !regions[1].is_file_backed());
+
+        assert_eq!(regions[2].path.as_deref(), Some("[stack]"));
+        assert!(regions[2].is_anonymous() && !regions[2].is_file_backed());
+
+        assert_eq!(regions[3].path.as_deref(), Some("[vvar]"));
+        assert!(!regions[3].is_anonymous() && !regions[3].is_file_backed());
+
+        assert_eq!(regions[4].path.as_deref(), Some("[vsyscall]"));
+        assert!(!regions[4].is_anonymous() && !regions[4].is_file_backed());
+
+        assert_eq!(
+            regions[5].path.as_deref(),
+            Some("/usr/lib/warframe/Warframe.x64.exe")
+        );
+        assert!(!regions[5].is_anonymous() && regions[5].is_file_backed());
+    }
+
+    /// A Steam library folder with a space in its name, plus the " (deleted)"
+    /// suffix an in-place game update leaves behind, are both shapes the game
+    /// image really appears in, and either one silently breaks the span match
+    /// if the pathname is read as a single whitespace token.
+    #[test]
+    fn game_image_span_survives_spaced_and_deleted_pathnames() {
+        let maps = "\
+1000-2000 r--p 0 08:01 1 /mnt/Games Drive/steamapps/common/Warframe/Warframe.x64.exe\n\
+2000-5000 r-xp 1000 08:01 1 /mnt/Games Drive/steamapps/common/Warframe/Warframe.x64.exe (deleted)\n\
+9000-a000 rw-p 0 00:00 0 [heap]\n";
+        let regions = parse_linux_maps(maps);
+
+        assert_eq!(
+            regions[0].path.as_deref(),
+            Some("/mnt/Games Drive/steamapps/common/Warframe/Warframe.x64.exe")
+        );
+        assert_eq!(regions[1].path.as_deref(), regions[0].path.as_deref());
+        assert_eq!(linux_game_image_span(&regions), Some(0x1000..0x5000));
     }
 
     #[test]
