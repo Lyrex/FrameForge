@@ -777,10 +777,47 @@ fn blob_extract_mod_rank(fingerprint: Option<&str>) -> u8 {
 static LAST_BLOB_REGION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// Digest of the last blob whose bytes were about to be parsed. Inventory
+// changes maybe once per mission, so most 10s scan cycles find byte-identical
+// JSON — hashing a few MB is far cheaper than rebuilding BlobInventory's
+// HashMaps/Vecs from scratch every cycle.
+static LAST_BLOB_DIGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Clear the fast-path region cache. Call when Warframe's PID changes so the
 /// next scan doesn't probe a stale address from the previous process instance.
 pub fn reset_last_blob_region() {
     LAST_BLOB_REGION.store(0, std::sync::atomic::Ordering::Relaxed);
+    LAST_BLOB_DIGEST.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Discard the digest baseline so the next candidate is parsed no matter what
+/// its bytes are. Call after a parse failure: skipping a re-parse is only safe
+/// while the baseline names bytes that are known to parse, and `blob_unchanged`
+/// records its argument before the parse outcome is known.
+fn forget_blob_digest() {
+    LAST_BLOB_DIGEST.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Checks `json` against the digest recorded by the previous call, then
+/// records `json`'s digest as the new baseline — check-and-update in one
+/// step, so a caller should invoke this exactly once per candidate blob,
+/// right before deciding whether to parse it.
+///
+/// A caller that then fails to parse `json` must call `forget_blob_digest`:
+/// the skip paths treat a match as "already parsed this successfully", and
+/// unparseable bytes that persist across cycles would otherwise be mistaken
+/// for a result and suppress the rest of the walk indefinitely.
+///
+/// Returns true when `json` is byte-identical to what the previous call saw.
+fn blob_unchanged(json: &[u8]) -> bool {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    json.hash(&mut hasher);
+    // OR in a set bit so a hashed digest can never equal the 0 sentinel that
+    // reset_last_blob_region stores — that sentinel must always compare as
+    // "changed" to force a re-parse after a PID change.
+    let digest = hasher.finish() | 1;
+    LAST_BLOB_DIGEST.swap(digest, std::sync::atomic::Ordering::Relaxed) == digest
 }
 
 /// Scans Warframe process memory for the FULL_ACCOUNT inventory blob and sends it
@@ -891,6 +928,11 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
                             nb.as_mut_ptr() as *mut c_void, cap, &mut nn) } == 0 { continue; }
                         stitched.extend_from_slice(&nb[..nn]);
                     }
+                    if blob_unchanged(&stitched) {
+                        eprintln!("[blob] fast-path hit at 0x{:012x}: unchanged since last scan — skipping parse", cached_addr);
+                        unsafe { CloseHandle(process); }
+                        return 0;
+                    }
                     if let Some(inv) = parse_full_account_blob(&stitched) {
                         eprintln!("[blob] fast-path hit at 0x{:012x}: {} unique, {} stackable",
                             cached_addr, inv.unique_items.len(), inv.stackable_items.len());
@@ -898,6 +940,7 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
                         unsafe { CloseHandle(process); }
                         return 0; // fast path never saves to disk
                     }
+                    forget_blob_digest();
                 }
             }
         }
@@ -1009,6 +1052,12 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
                 .windows(END_MARKER.len())
                 .any(|w| w == END_MARKER);
             if has_end && find_blob_end(&scan.data).is_some() {
+                if !save && blob_unchanged(&scan.data) {
+                    eprintln!("[blob] scan#{} unchanged since last scan — skipping parse", scan.id);
+                    LAST_BLOB_REGION.store(scan.start_region_addr as u64, std::sync::atomic::Ordering::Relaxed);
+                    found_result = true;
+                    return false;
+                }
                 match parse_full_account_blob(&scan.data) {
                     Some(inv) => {
                         eprintln!("[blob] scan#{} SUCCESS at 0x{:012x}: {} unique, {} stackable, {} mods",
@@ -1027,6 +1076,7 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
                     }
                     None => {
                         eprintln!("[blob] scan#{} end marker found but JSON parse failed — dropped", scan.id);
+                        forget_blob_digest();
                     }
                 }
                 false // remove completed (or failed) scan
@@ -1103,7 +1153,12 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
             );
             let seed = combined[json_open..].to_vec();
 
-            if find_blob_end(&seed).is_some() {
+            let seed_ends = find_blob_end(&seed).is_some();
+            if seed_ends && !save && blob_unchanged(&seed) {
+                eprintln!("[blob] scan#{} immediate hit: unchanged since last scan — skipping parse", id);
+                LAST_BLOB_REGION.store(seed_addr as u64, std::sync::atomic::Ordering::Relaxed);
+                found_result = true;
+            } else if seed_ends {
                 match parse_full_account_blob(&seed) {
                     Some(inv) => {
                         eprintln!("[blob] scan#{} immediate SUCCESS at 0x{:012x}: {} unique, {} stackable",
@@ -1120,6 +1175,7 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
                     }
                     None => {
                         eprintln!("[blob] scan#{} immediate end found but parse failed — dropping", id);
+                        forget_blob_digest();
                     }
                 }
             } else {
@@ -1458,6 +1514,44 @@ mod seed_tests {
         assert_eq!(json.len(), blob_len);
         assert_eq!(json[0], b'{');
         assert!(serde_json::from_slice::<serde_json::Value>(&json).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod blob_digest_tests {
+    use super::{blob_unchanged, forget_blob_digest, reset_last_blob_region};
+
+    // LAST_BLOB_DIGEST is a process-global static shared with every other
+    // test in this binary, so each case resets it first and runs its
+    // assertions in one #[test] rather than relying on test isolation.
+    #[test]
+    fn digest_tracks_changes_and_resets() {
+        reset_last_blob_region();
+
+        let blob = b"{\"SubscribedToEmails\":1,\"RegularCredits\":100}".to_vec();
+        assert!(!blob_unchanged(&blob), "first call always reports changed");
+        assert!(blob_unchanged(&blob), "identical bytes report unchanged");
+
+        let mut mutated = blob.clone();
+        mutated[0] = b'[';
+        assert!(!blob_unchanged(&mutated), "a changed byte must report changed");
+        assert!(blob_unchanged(&mutated), "the new bytes become the baseline");
+
+        reset_last_blob_region();
+        assert!(!blob_unchanged(&mutated), "reset forces the next call to report changed");
+    }
+
+    // Unparseable bytes that persist across scan cycles must not start
+    // reporting as unchanged — the skip paths read that as "already parsed
+    // this", which would wedge the walk on a region that never parsed.
+    #[test]
+    fn forgetting_after_a_failed_parse_forces_a_retry() {
+        reset_last_blob_region();
+
+        let garbage = b"{\"MiscItems\":[ truncated".to_vec();
+        assert!(!blob_unchanged(&garbage), "first sighting reports changed");
+        forget_blob_digest();
+        assert!(!blob_unchanged(&garbage), "same bytes report changed again after a failed parse");
     }
 }
 
