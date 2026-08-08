@@ -1472,10 +1472,11 @@ fn scan_windows_cached_blob(process: windows_sys::Win32::Foundation::HANDLE) -> 
         return None;
     }
 
-    let chunk = &buf[..n];
-    let is_mission = chunk.windows(MISSION_DELTA.len()).any(|w| w == MISSION_DELTA);
-    let has_anchor = ANCHORS.iter().any(|a| chunk.windows(a.len()).any(|w| w == *a));
-    let has_lotus  = chunk.windows(LOTUS_KEY.len()).any(|w| w == LOTUS_KEY);
+    buf.truncate(n);
+    let chunk = &buf[..];
+    let is_mission = memmem::find(chunk, MISSION_DELTA).is_some();
+    let has_anchor = ANCHORS.iter().any(|a| memmem::find(chunk, a).is_some());
+    let has_lotus  = memmem::find(chunk, LOTUS_KEY).is_some();
     // cached_addr is the exact byte of the blob's outer {, so seed from byte 0.
     // Accept regions that are blob data even when SubscribedToEmails is in a
     // later region (field order varies by account).
@@ -1483,7 +1484,7 @@ fn scan_windows_cached_blob(process: windows_sys::Win32::Foundation::HANDLE) -> 
         return None;
     }
 
-    let mut stitched = chunk.to_vec();
+    let mut stitched = buf;
     let mut walk = cached_addr + n;
     while stitched.len() < MAX_SCAN && find_blob_end(&stitched).is_none() {
         let mut nmbi = unsafe { mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
@@ -1674,9 +1675,7 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
                 return false; // drop oversized scan
             }
             // Only search the newly-added window, not the full buffer.
-            let has_end = scan.data[search_from..]
-                .windows(END_MARKER.len())
-                .any(|w| w == END_MARKER);
+            let has_end = memmem::find(&scan.data[search_from..], END_MARKER).is_some();
             if has_end && find_blob_end(&scan.data).is_some() {
                 if !save && blob_unchanged(&scan.data) {
                     eprintln!("[blob] scan#{} unchanged since last scan — skipping parse", scan.id);
@@ -1716,11 +1715,11 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
         if found_result { continue; }
 
         let t2 = std::time::Instant::now();
-        let has_start     = chunk.windows(START_MARKER.len()).any(|w| w == START_MARKER);
-        let has_alt_start = ALT_STARTS.iter().any(|a| chunk.windows(a.len()).any(|w| w == *a));
-        let is_mission    = chunk.windows(MISSION_DELTA.len()).any(|w| w == MISSION_DELTA);
-        let has_anchor    = ANCHORS.iter().any(|a| chunk.windows(a.len()).any(|w| w == *a));
-        let has_lotus     = chunk.windows(LOTUS_KEY.len()).any(|w| w == LOTUS_KEY);
+        let has_start     = memmem::find(chunk, START_MARKER).is_some();
+        let has_alt_start = ALT_STARTS.iter().any(|a| memmem::find(chunk, a).is_some());
+        let is_mission    = memmem::find(chunk, MISSION_DELTA).is_some();
+        let has_anchor    = ANCHORS.iter().any(|a| memmem::find(chunk, a).is_some());
+        let has_lotus     = memmem::find(chunk, LOTUS_KEY).is_some();
         let qualifies     = (has_start || has_alt_start) && !is_mission && (has_anchor || has_lotus);
         t_search += t2.elapsed();
 
