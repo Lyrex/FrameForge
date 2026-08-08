@@ -71,6 +71,11 @@ pub struct AppState {
     /// Controls the raw memory string-dump background thread.
     pub raw_scan_active: Arc<AtomicBool>,
     pub raw_scan_path: PathBuf,
+    /// Set by the EE.log tail when Warframe reports finishing an inventory
+    /// refresh; cleared by the monitor loop when it acts on it. A bool rather
+    /// than a count because the game flushes its log in bursts, so several
+    /// markers can land at once and all of them call for the same single walk.
+    pub blob_sync_pending: Arc<AtomicBool>,
     /// When true, save a timestamped inventory blob to blobs/ on each full scan pass.
     pub blob_log_enabled: Arc<AtomicBool>,
     pub blob_log_dir: PathBuf,
@@ -5238,6 +5243,15 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
     let ee_last_path = last_found_path.clone();
     let session_log_path = std::env::temp_dir().join("frameforge_overlay_session.txt");
 
+    // The gate only makes blob capture faster; with no log to tail the monitor
+    // still escalates on its own interval. A missing gate therefore changes no
+    // behaviour, so it is reported once at startup.
+    let blob_sync_pending = state.blob_sync_pending.clone();
+    eprintln!(
+        "[monitor] inventory-sync marker gate {}",
+        if ee_log_path.is_some() { "armed" } else { "disarmed (no EE.log)" },
+    );
+
     if let Some(log_path) = ee_log_path {
         let flag = reward_flag.clone();
         std::thread::spawn(move || {
@@ -5358,6 +5372,12 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                 // squad_size = 1 (local) + count("Still waiting") lines.
                 // Logging only for now; item path matching is a future improvement.
                 for line in buf.lines() {
+                    // Separates "the game fetched inventory" from "some
+                    // unrelated allocation moved". The monitor uses it to decide
+                    // whether a cache miss is worth a full memory walk.
+                    if log_parser::is_inventory_sync_line(line) {
+                        blob_sync_pending.store(true, Ordering::SeqCst);
+                    }
                     let ll = line.to_lowercase();
                     if ll.contains("voidprojections: getvoidprojectionreward") {
                         vp_in_seq  = true;
@@ -8713,6 +8733,7 @@ pub fn run() {
             monitor_active: Arc::new(AtomicBool::new(false)),
             raw_scan_active: Arc::new(AtomicBool::new(false)),
             raw_scan_path,
+            blob_sync_pending: Arc::new(AtomicBool::new(false)),
             blob_log_enabled: Arc::new(AtomicBool::new(false)),
             blob_log_dir,
             api_log_enabled: Arc::new(AtomicBool::new(false)),
