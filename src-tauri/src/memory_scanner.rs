@@ -827,8 +827,15 @@ fn forget_blob_digest() {
 /// Returns true when `json` is byte-identical to what the previous call saw.
 fn blob_unchanged(json: &[u8]) -> bool {
     use std::hash::{DefaultHasher, Hash, Hasher};
+    // Callers hand over a stitched buffer, not a trimmed blob. The stitch stops
+    // at the region that closes the JSON, so everything past the closing brace
+    // is whatever heap shared that region, tens of megabytes of it, rewritten
+    // constantly by a running client. Hash that tail and the digest never
+    // matches, so every scan reparses and the skip never happens. Bytes with no
+    // blob end are hashed whole; they only need to compare equal to themselves.
+    let blob = &json[..find_blob_end(json).unwrap_or(json.len())];
     let mut hasher = DefaultHasher::new();
-    json.hash(&mut hasher);
+    blob.hash(&mut hasher);
     // OR in a set bit so a hashed digest can never equal the 0 sentinel that
     // reset_last_blob_region stores — that sentinel must always compare as
     // "changed" to force a re-parse after a PID change.
@@ -1547,11 +1554,15 @@ mod seed_tests {
 mod blob_digest_tests {
     use super::{blob_unchanged, forget_blob_digest, reset_last_blob_region};
 
-    // LAST_BLOB_DIGEST is a process-global static shared with every other
-    // test in this binary, so each case resets it first and runs its
-    // assertions in one #[test] rather than relying on test isolation.
+    // LAST_BLOB_DIGEST is a process-global static shared with every other test
+    // in this binary. Resetting first is not enough on its own: these cases run
+    // in parallel, so one can land its own digest write between another's reset
+    // and its assertions. Taking this lock keeps them off each other.
+    static DIGEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn digest_tracks_changes_and_resets() {
+        let _guard = DIGEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_last_blob_region();
 
         let blob = b"{\"SubscribedToEmails\":1,\"RegularCredits\":100}".to_vec();
@@ -1567,11 +1578,31 @@ mod blob_digest_tests {
         assert!(!blob_unchanged(&mutated), "reset forces the next call to report changed");
     }
 
+    // The scan stitches whole regions, so the blob arrives with a tail of
+    // unrelated heap that a running client rewrites between cycles. Digesting
+    // that tail is indistinguishable from the inventory itself changing, which
+    // reparses a settled inventory on every cycle.
+    #[test]
+    fn a_rewritten_tail_after_the_blob_is_not_a_change() {
+        let _guard = DIGEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_last_blob_region();
+
+        let blob = br#"{"SubscribedToEmails":1,"DeathSquadable":false}"#;
+        let mut first = blob.to_vec();
+        first.extend_from_slice(b"\x00\x11garbage from a neighbouring allocation");
+        let mut second = blob.to_vec();
+        second.extend_from_slice(b"\xff\xfe an entirely different neighbour, and longer");
+
+        assert!(!blob_unchanged(&first), "first sighting reports changed");
+        assert!(blob_unchanged(&second), "same blob, different tail, is unchanged");
+    }
+
     // Unparseable bytes that persist across scan cycles must not start
     // reporting as unchanged — the skip paths read that as "already parsed
     // this", which would wedge the walk on a region that never parsed.
     #[test]
     fn forgetting_after_a_failed_parse_forces_a_retry() {
+        let _guard = DIGEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_last_blob_region();
 
         let garbage = b"{\"MiscItems\":[ truncated".to_vec();
