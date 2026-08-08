@@ -4627,7 +4627,8 @@ pub struct InventoryUpdate {
     pub player_name: Option<String>,
 }
 
-/// Never walk more often than the old fixed cadence.
+/// Floor on walk frequency, inherited from the fixed cadence this policy
+/// replaced: whatever the probe reports, walking is never worth doing faster.
 const WALK_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 /// A client with no blob found yet is usually at the login screen. The marker
 /// ends that wait as soon as the inventory arrives, so this interval only
@@ -4646,15 +4647,6 @@ const WALK_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(90
 /// the common cases in half a millisecond: a blob that grew in place is
 /// `Updated`, one that moved is `CacheMiss`.
 ///
-///   - `Updated` needs no walk. The new inventory is already on its way to the
-///     monitor, and any outstanding marker is explained by it.
-///   - `Unchanged` with a marker still walks. The client fetched inventory and
-///     our copy did not move, which is usually a sync carrying no delta, but it
-///     is also what a stale address holding the old bytes looks like.
-///   - A miss with no blob ever found is the login screen, where the inventory
-///     is not in memory yet. Re-checking that on a short timer is what makes
-///     the game stutter.
-///
 /// None of this depends on the marker for correctness. Every case has an
 /// interval that fires without one, so a missing EE.log or an unlocatable log
 /// buffer costs only latency.
@@ -4669,6 +4661,8 @@ fn walk_is_due(
         ScanOutcome::Updated => false,
         ScanOutcome::CacheMiss if sync_seen => true,
         ScanOutcome::CacheMiss if has_cached_blob => since_walk >= WALK_MIN_INTERVAL,
+        // A sync that moved nothing looks identical to a stale address still
+        // holding the old bytes, and the probe cannot tell them apart.
         ScanOutcome::Unchanged if sync_seen => since_walk >= WALK_MIN_INTERVAL,
         ScanOutcome::CacheMiss => since_walk >= WALK_COLD_INTERVAL,
         ScanOutcome::Unchanged => since_walk >= WALK_MAX_INTERVAL,
