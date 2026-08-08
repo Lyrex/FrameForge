@@ -4711,6 +4711,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
     let shared_crafting      = state.current_crafting.clone();
     let blob_log_enabled     = state.blob_log_enabled.clone();
     let blob_log_dir         = state.blob_log_dir.clone();
+    let blob_sync_pending    = state.blob_sync_pending.clone();
     let reward_app = app.clone();  // clone before app is moved into the inventory thread
 
     // Channel for the blob capture thread to deliver a parsed BlobInventory to the monitor loop.
@@ -4830,7 +4831,8 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
             .filter(|(_, v)| !v.archon_shards.is_empty())
             .map(|(k, v)| (k.clone(), v.archon_shards.clone()))
             .collect();
-        let mut last_blob_time: Option<std::time::Instant> = None;
+        let mut last_walk_time: Option<std::time::Instant> = None;
+        let mut last_probe_time: Option<std::time::Instant> = None;
         // Guard against overlapping captures: a full memory walk can take >10 s on large
         // game processes, so without this flag we'd stack up concurrent scan threads.
         let blob_scan_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -5035,9 +5037,6 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                 }
             }
 
-            // Periodic blob capture every 10s while game is running.
-            // blob_scan_active prevents overlapping captures — a full memory walk on a
-            // large game process can exceed 10 s, so without the guard we'd stack threads.
             // Re-enumerate processes at most every 5 s (CreateToolhelp32Snapshot overhead).
             let needs_pid_check = last_pid_check
                 .map_or(true, |t: std::time::Instant| t.elapsed().as_secs() >= 5);
@@ -5055,12 +5054,43 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
             }
             let game_running = cached_game_running;
             if game_running {
-                let should_capture = last_blob_time
-                    .map_or(true, |t: std::time::Instant| t.elapsed() >= std::time::Duration::from_secs(10));
-                let already_running = blob_scan_active.load(Ordering::SeqCst);
-                if should_capture && !already_running {
+                // ── Blob capture: cheap probe, rate-limited walk ──────────────
+                const PROBE_INTERVAL:    std::time::Duration = std::time::Duration::from_secs(2);
+                const WALK_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+                const WALK_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+                let walk_in_flight = blob_scan_active.load(Ordering::SeqCst);
+                let probe_due = last_probe_time
+                    .map_or(true, |t: std::time::Instant| t.elapsed() >= PROBE_INTERVAL);
+
+                // Probes run inline, so one must never start behind a walk that
+                // is already reading the same process.
+                let mut should_capture = false;
+                if probe_due && !walk_in_flight {
+                    last_probe_time = Some(std::time::Instant::now());
+                    let outcome = memory_scanner::probe_cached_blob(blob_tx.clone());
+                    let sync_seen = blob_sync_pending.load(Ordering::SeqCst);
+                    let since_walk = last_walk_time
+                        .map_or(std::time::Duration::MAX, |t: std::time::Instant| t.elapsed());
+                    should_capture = match outcome {
+                        memory_scanner::ScanOutcome::CacheMiss if sync_seen => true,
+                        memory_scanner::ScanOutcome::CacheMiss => since_walk >= WALK_MIN_INTERVAL,
+                        _ => since_walk >= WALK_MAX_INTERVAL,
+                    };
+                    // Hold the marker when it was neither acted on nor answered:
+                    // a miss the rate limit turned down is the one case where it
+                    // still has work to do on a later tick.
+                    if should_capture || outcome != memory_scanner::ScanOutcome::CacheMiss {
+                        blob_sync_pending.store(false, Ordering::SeqCst);
+                    }
+                    if should_capture {
+                        eprintln!("[monitor] escalating to full walk (outcome={outcome:?} sync_marker={sync_seen})");
+                    }
+                }
+
+                if should_capture && !walk_in_flight {
                     blob_scan_active.store(true, Ordering::SeqCst);
-                    last_blob_time = Some(std::time::Instant::now());
+                    last_walk_time = Some(std::time::Instant::now());
                     let ts     = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
                     let dir    = blob_log_dir.clone();
                     let tx     = blob_tx.clone();
