@@ -1334,6 +1334,10 @@ enum CachedBlobScan {
     Unchanged,
 }
 
+pub fn has_cached_blob() -> bool {
+    LAST_BLOB_REGION.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
 /// Clear the fast-path region cache. Call when Warframe's PID changes so the
 /// next scan doesn't probe a stale address from the previous process instance.
 pub fn reset_last_blob_region() {

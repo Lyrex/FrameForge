@@ -4627,6 +4627,44 @@ pub struct InventoryUpdate {
     pub player_name: Option<String>,
 }
 
+/// Never walk more often than the old fixed cadence.
+const WALK_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// Backstop for the cases a probe cannot see: a stale address that still holds
+/// an old parseable copy answers "unchanged" forever, and a cold client may
+/// load its inventory without us ever seeing the marker that says so.
+const WALK_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether a full region walk has earned its cost this tick.
+///
+/// A walk reads gigabytes and visibly costs the player frames, so the rules are
+/// about avoiding the walks that cannot pay:
+///
+///   - A sync marker means the client really did fetch inventory, which is the
+///     one signal that resolves an ambiguous miss. Escalate at once.
+///   - A miss with a blob already known costs `WALK_MIN_INTERVAL`. The game
+///     reallocates the buffer when the inventory grows, so a miss here has a
+///     good chance of being a real change worth chasing.
+///   - A miss with *no* blob ever found is the login screen: the inventory is
+///     genuinely not in memory yet, and walking every 10 s to re-prove that is
+///     what makes the game stutter for 20 s at a time. Wait for the backstop
+///     and let the marker do the work.
+///
+/// Correctness never rests on the marker. Every case still has an interval that
+/// fires without one, so a missing EE.log or an unlocatable log buffer costs
+/// only latency.
+fn walk_is_due(
+    outcome: &memory_scanner::ScanOutcome,
+    sync_seen: bool,
+    has_cached_blob: bool,
+    since_walk: std::time::Duration,
+) -> bool {
+    match outcome {
+        memory_scanner::ScanOutcome::CacheMiss if sync_seen => true,
+        memory_scanner::ScanOutcome::CacheMiss if has_cached_blob => since_walk >= WALK_MIN_INTERVAL,
+        _ => since_walk >= WALK_MAX_INTERVAL,
+    }
+}
+
 #[tauri::command]
 async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     if state.monitor_active.swap(true, Ordering::SeqCst) {
@@ -5056,9 +5094,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
             let game_running = cached_game_running;
             if game_running {
                 // ── Blob capture: cheap probe, rate-limited walk ──────────────
-                const PROBE_INTERVAL:    std::time::Duration = std::time::Duration::from_secs(2);
-                const WALK_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-                const WALK_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+                const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
                 let walk_in_flight = blob_scan_active.load(Ordering::SeqCst);
                 let probe_due = last_probe_time
@@ -5079,11 +5115,12 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                         | blob_sync_pending.load(Ordering::SeqCst);
                     let since_walk = last_walk_time
                         .map_or(std::time::Duration::MAX, |t: std::time::Instant| t.elapsed());
-                    should_capture = match outcome {
-                        memory_scanner::ScanOutcome::CacheMiss if sync_seen => true,
-                        memory_scanner::ScanOutcome::CacheMiss => since_walk >= WALK_MIN_INTERVAL,
-                        _ => since_walk >= WALK_MAX_INTERVAL,
-                    };
+                    should_capture = walk_is_due(
+                        &outcome,
+                        sync_seen,
+                        memory_scanner::has_cached_blob(),
+                        since_walk,
+                    );
                     // Hold the marker when it was neither acted on nor answered:
                     // a miss the rate limit turned down is the one case where it
                     // still has work to do on a later tick.
@@ -5091,7 +5128,8 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                         blob_sync_pending.store(false, Ordering::SeqCst);
                     }
                     if should_capture {
-                        eprintln!("[monitor] escalating to full walk (outcome={outcome:?} sync_marker={sync_seen} since_last_walk={})",
+                        eprintln!("[monitor] escalating to full walk (outcome={outcome:?} sync_marker={sync_seen} blob_known={} since_last_walk={})",
+                            memory_scanner::has_cached_blob(),
                             match last_walk_time {
                                 Some(t) => format!("{:.1}s", t.elapsed().as_secs_f64()),
                                 None => "never".into(),
@@ -9072,6 +9110,56 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod walk_policy_tests {
+    use super::{walk_is_due, WALK_MAX_INTERVAL, WALK_MIN_INTERVAL};
+    use crate::memory_scanner::ScanOutcome;
+    use std::time::Duration;
+
+    /// At the login screen no blob has ever been found, and re-checking that
+    /// every WALK_MIN_INTERVAL reads gigabytes and costs the player frames for
+    /// seconds at a time.
+    #[test]
+    fn a_client_with_no_blob_yet_waits_for_the_backstop() {
+        let just_walked = WALK_MIN_INTERVAL + Duration::from_secs(1);
+        assert!(!walk_is_due(&ScanOutcome::CacheMiss, false, false, just_walked));
+        assert!(walk_is_due(&ScanOutcome::CacheMiss, false, false, WALK_MAX_INTERVAL));
+    }
+
+    /// Once a blob is known, a miss plausibly means the game reallocated it
+    /// because the inventory changed — worth chasing at the old cadence.
+    #[test]
+    fn a_miss_on_a_known_blob_keeps_the_old_cadence() {
+        assert!(walk_is_due(&ScanOutcome::CacheMiss, false, true, WALK_MIN_INTERVAL));
+        assert!(!walk_is_due(&ScanOutcome::CacheMiss, false, true, Duration::from_secs(4)));
+    }
+
+    /// The marker resolves the ambiguity outright, including at the login
+    /// screen, where the first sync arrives.
+    #[test]
+    fn a_sync_marker_escalates_immediately() {
+        assert!(walk_is_due(&ScanOutcome::CacheMiss, true, false, Duration::ZERO));
+        assert!(walk_is_due(&ScanOutcome::CacheMiss, true, true, Duration::ZERO));
+    }
+
+    /// A probe that answered definitively has nothing to escalate, but a stale
+    /// address holding an old parseable copy answers "unchanged" forever, so
+    /// the backstop still has to fire.
+    #[test]
+    fn a_definitive_probe_only_walks_on_the_backstop() {
+        assert!(!walk_is_due(&ScanOutcome::Unchanged, false, true, WALK_MIN_INTERVAL));
+        assert!(!walk_is_due(&ScanOutcome::Updated, true, true, WALK_MIN_INTERVAL));
+        assert!(walk_is_due(&ScanOutcome::Unchanged, false, true, WALK_MAX_INTERVAL));
+    }
+
+    /// The first tick after the game appears has no previous walk to rate-limit
+    /// against, so the app still gets one immediately at startup.
+    #[test]
+    fn the_first_walk_is_never_delayed() {
+        assert!(walk_is_due(&ScanOutcome::CacheMiss, false, false, Duration::MAX));
+    }
 }
 
 #[cfg(test)]
