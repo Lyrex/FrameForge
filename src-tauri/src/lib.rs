@@ -5047,6 +5047,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                     if current_pid.is_some() {
                         eprintln!("[monitor] Warframe PID changed ({:?} → {:?}), clearing blob region cache", last_pid, current_pid);
                         memory_scanner::reset_last_blob_region();
+                        memory_scanner::reset_log_region();
                     }
                     last_pid = current_pid;
                 }
@@ -5069,7 +5070,13 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                 if probe_due && !walk_in_flight {
                     last_probe_time = Some(std::time::Instant::now());
                     let outcome = memory_scanner::probe_cached_blob(blob_tx.clone());
-                    let sync_seen = blob_sync_pending.load(Ordering::SeqCst);
+                    // Two sources for the same marker. The tail sees it only
+                    // after Warframe flushes, which lags the event by tens of
+                    // seconds; reading the log text out of the process sees it
+                    // as soon as the game formats the line, and falls back to
+                    // the tail when the buffers cannot be located.
+                    let sync_seen = memory_scanner::probe_inventory_sync_marker()
+                        | blob_sync_pending.load(Ordering::SeqCst);
                     let since_walk = last_walk_time
                         .map_or(std::time::Duration::MAX, |t: std::time::Instant| t.elapsed());
                     should_capture = match outcome {

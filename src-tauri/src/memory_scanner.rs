@@ -2363,6 +2363,323 @@ pub fn probe_cached_blob(blob_tx: std::sync::mpsc::Sender<BlobInventory>) -> Sca
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub fn probe_cached_blob(_blob_tx: std::sync::mpsc::Sender<BlobInventory>) -> ScanOutcome { ScanOutcome::CacheMiss }
 
+// ─── Inventory-sync marker, read from memory rather than from EE.log ──────────
+//
+// Warframe composes its log lines in process memory long before they reach
+// EE.log: the game buffers writes and flushes in bursts, and sampling the live
+// client showed the newest in-memory line running 23 s ahead of the newest line
+// on disk. Tailing the file therefore reports an inventory sync at an unknown,
+// variable delay, and that delay lands on every capture gated behind it.
+//
+// The formatted lines are findable by content, so no pointer chain and no
+// per-build offsets are involved:
+//
+//   19761.848 Sys [Info]: OnInventoryResults completed in 339ms
+//
+// Only the log text holds ` Sys [Info]: ` preceded by a seconds-since-launch
+// timestamp, and once the buffer is found its address caches like
+// LAST_BLOB_REGION.
+
+/// The formatted marker, sharing its wording with the file tail in
+/// `log_parser::is_inventory_sync_line`; both read the same line.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const SYNC_MARKER: &[u8] = b"OnInventoryResults completed in";
+
+/// Present on every log line, so it identifies the buffer regardless of what
+/// the game happens to have logged recently.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const LOG_LINE_MARKER: &[u8] = b" Sys [Info]: ";
+
+/// The candidate buffers are a few MB against several GB of readable mappings,
+/// so anything larger is some other allocation that happens to quote a log line.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const MAX_LOG_REGION: usize = 16 * 1024 * 1024;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+static LAST_LOG_REGION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Game timestamp of the newest sync marker already reported, as `f64` bits.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+static LAST_SYNC_TIMESTAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Forget the log buffer's address and the marker baseline. Call alongside
+/// [`reset_last_blob_region`] when the PID changes: the timestamps are seconds
+/// since *that* client launched, so a baseline from the previous process would
+/// swallow every marker the new one writes.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub fn reset_log_region() {
+    LAST_LOG_REGION.store(0, std::sync::atomic::Ordering::Relaxed);
+    LAST_SYNC_TIMESTAMP.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub fn reset_log_region() {}
+
+/// Seconds-since-launch stamp opening the line that `offset` falls inside, e.g.
+/// `19761.848` from `19761.848 Sys [Info]: …`.
+///
+/// Both buffers hold complete formatted lines but end them differently: the
+/// pending file-write buffer uses CRLF, the heap ring LF, so the search back
+/// to the line start stops at either.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn line_timestamp(chunk: &[u8], offset: usize) -> Option<f64> {
+    let start = chunk[..offset]
+        .iter()
+        .rposition(|&byte| byte == b'\n' || byte == b'\r')
+        .map_or(0, |index| index + 1);
+    // `offset` lands on the space opening ` Sys [Info]: ` for one caller and
+    // partway into the message for the other, so the stamp runs to whichever
+    // comes first: the next space, or the marker itself.
+    let line = &chunk[start..offset];
+    let end = line.iter().position(|&byte| byte == b' ').unwrap_or(line.len());
+    let stamp = std::str::from_utf8(&line[..end]).ok()?;
+    // Reject anything that is not the timestamp shape: a bare integer or a
+    // stray word would otherwise parse and then compare as a valid ordering.
+    let (seconds, millis) = stamp.split_once('.')?;
+    if seconds.is_empty()
+        || !seconds.bytes().all(|byte| byte.is_ascii_digit())
+        || millis.len() != 3
+        || !millis.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    stamp.parse().ok()
+}
+
+/// True when `chunk` holds formatted log lines rather than, say, the `.rdata`
+/// copy of the format string. The timestamp is what tells the two apart.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn looks_like_log_buffer(chunk: &[u8]) -> bool {
+    let mut from = 0;
+    // A handful of probes is enough: the log text is dense with these, so a
+    // buffer that fails several in a row is not it.
+    for _ in 0..8 {
+        let Some(hit) = memmem::find(&chunk[from..], LOG_LINE_MARKER) else { return false };
+        let offset = from + hit;
+        if line_timestamp(chunk, offset).is_some() {
+            return true;
+        }
+        from = offset + LOG_LINE_MARKER.len();
+    }
+    false
+}
+
+/// Newest game timestamp among the sync markers in `chunk`.
+///
+/// Every match is examined rather than just the last, because the heap ring
+/// wraps: the newest line is not necessarily the one at the highest address.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn newest_sync_timestamp(chunk: &[u8]) -> Option<f64> {
+    let mut newest: Option<f64> = None;
+    let mut from = 0;
+    while let Some(hit) = memmem::find(&chunk[from..], SYNC_MARKER) {
+        let offset = from + hit;
+        if let Some(stamp) = line_timestamp(chunk, offset) {
+            newest = Some(newest.map_or(stamp, |best: f64| best.max(stamp)));
+        }
+        from = offset + SYNC_MARKER.len();
+    }
+    newest
+}
+
+/// Fold a freshly-observed marker timestamp into the baseline, reporting
+/// whether it names a sync that has not been reported yet.
+///
+/// A timestamp *older* than the baseline counts as new: the stamps are seconds
+/// since the client launched, so the only way they run backwards is a game
+/// restart, and the alternative is ignoring every marker until the new client
+/// has been up as long as the old one was.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn sync_marker_is_new(newest: Option<f64>) -> bool {
+    let Some(newest) = newest else { return false };
+    let previous = f64::from_bits(LAST_SYNC_TIMESTAMP.swap(newest.to_bits(), std::sync::atomic::Ordering::Relaxed));
+    // The first probe only establishes the baseline. Reporting the markers
+    // already in the buffer at startup would be reporting history: the first
+    // capture walks memory unconditionally anyway.
+    previous != 0.0 && newest != previous
+}
+
+/// Newest sync-marker timestamp currently in the game's log buffers, probing
+/// the remembered mapping first and searching for it again when that fails.
+#[cfg(target_os = "linux")]
+fn linux_newest_sync_timestamp(process: &LinuxProcess, regions: &[LinuxRegion]) -> Option<f64> {
+    let mut buffer = Vec::new();
+    let mut read_region = |region: &LinuxRegion, buffer: &mut Vec<u8>| -> Option<usize> {
+        buffer.resize(region.len.min(MAX_LOG_REGION), 0);
+        match process.read(region.start, buffer) {
+            Ok(read) if read > LOG_LINE_MARKER.len() => Some(read),
+            Ok(_) | Err(_) => None,
+        }
+    };
+
+    let cached = LAST_LOG_REGION.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    if cached != 0 {
+        if let Some(region) = regions.iter().find(|region| region.start == cached) {
+            if let Some(read) = read_region(region, &mut buffer) {
+                if looks_like_log_buffer(&buffer[..read]) {
+                    return newest_sync_timestamp(&buffer[..read]);
+                }
+            }
+        }
+        // The mapping is gone or holds something else now; fall through and
+        // look again rather than reporting a silent nothing from here on.
+        LAST_LOG_REGION.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Cold search. There are two copies of the log text: the pending
+    // file-write buffer and a heap ring of recent lines. Which one is
+    // further ahead depends on where the game is in its flush cycle, so both
+    // are read and the newer marker wins.
+    let mut newest: Option<f64> = None;
+    let mut found = 0;
+    for region in regions {
+        if region.executable || region.len > MAX_LOG_REGION {
+            continue;
+        }
+        let Some(read) = read_region(region, &mut buffer) else { continue };
+        let chunk = &buffer[..read];
+        if !looks_like_log_buffer(chunk) {
+            continue;
+        }
+        if found == 0 {
+            eprintln!("[log] sync-marker buffer at 0x{:012x} ({} KB)", region.start, read / 1000);
+            LAST_LOG_REGION.store(region.start as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(stamp) = newest_sync_timestamp(chunk) {
+            newest = Some(newest.map_or(stamp, |best: f64| best.max(stamp)));
+        }
+        found += 1;
+        if found == 2 {
+            break;
+        }
+    }
+    if found == 0 {
+        eprintln!("[log] no in-memory log buffer found; sync markers come from the EE.log tail only");
+    }
+    newest
+}
+
+#[cfg(target_os = "windows")]
+fn windows_newest_sync_timestamp(process: windows_sys::Win32::Foundation::HANDLE) -> Option<f64> {
+    use std::ffi::c_void;
+    use std::mem;
+    use windows_sys::Win32::System::{
+        Diagnostics::Debug::ReadProcessMemory,
+        Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS},
+    };
+
+    // Executable pages hold the `.rdata` copy of the format string, never a
+    // formatted line, so skipping them also skips the obvious false positive.
+    const EXEC_MASK: u32 = 0x10 | 0x20 | 0x40 | 0x80;
+
+    let mut buffer = Vec::new();
+    let read_region = |address: usize, size: usize, buffer: &mut Vec<u8>| -> Option<usize> {
+        buffer.resize(size.min(MAX_LOG_REGION), 0);
+        let mut read = 0usize;
+        let ok = unsafe { ReadProcessMemory(process, address as *const c_void,
+            buffer.as_mut_ptr() as *mut c_void, buffer.len(), &mut read) } != 0;
+        (ok && read > LOG_LINE_MARKER.len()).then_some(read)
+    };
+    let query = |address: usize| -> Option<MEMORY_BASIC_INFORMATION> {
+        let mut mbi = unsafe { mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
+        let ok = unsafe { VirtualQueryEx(process, address as *const c_void, &mut mbi,
+            mem::size_of::<MEMORY_BASIC_INFORMATION>()) } != 0;
+        ok.then_some(mbi)
+    };
+    let readable = |mbi: &MEMORY_BASIC_INFORMATION| {
+        mbi.State == MEM_COMMIT
+            && mbi.Protect & PAGE_GUARD == 0
+            && mbi.Protect & PAGE_NOACCESS == 0
+            && mbi.Protect & EXEC_MASK == 0
+            && mbi.RegionSize > 0
+    };
+
+    let cached = LAST_LOG_REGION.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    if cached != 0 {
+        if let Some(mbi) = query(cached).filter(readable).filter(|mbi| mbi.BaseAddress as usize == cached) {
+            if let Some(read) = read_region(cached, mbi.RegionSize, &mut buffer) {
+                if looks_like_log_buffer(&buffer[..read]) {
+                    return newest_sync_timestamp(&buffer[..read]);
+                }
+            }
+        }
+        // The mapping is gone or holds something else now; fall through and
+        // look again rather than reporting a silent nothing from here on.
+        LAST_LOG_REGION.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Cold search. There are two copies of the log text: the pending
+    // file-write buffer and a heap ring of recent lines. Which one is
+    // further ahead depends on where the game is in its flush cycle, so both
+    // are read and the newer marker wins.
+    let mut newest: Option<f64> = None;
+    let mut found = 0;
+    let mut address = 0usize;
+    while let Some(mbi) = query(address) {
+        let base = mbi.BaseAddress as usize;
+        let size = mbi.RegionSize;
+        let Some(next) = base.checked_add(size).filter(|next| *next > address) else { break };
+        address = next;
+        if !readable(&mbi) || size > MAX_LOG_REGION {
+            continue;
+        }
+        let Some(read) = read_region(base, size, &mut buffer) else { continue };
+        let chunk = &buffer[..read];
+        if !looks_like_log_buffer(chunk) {
+            continue;
+        }
+        if found == 0 {
+            eprintln!("[log] sync-marker buffer at 0x{base:012x} ({} KB)", read / 1000);
+            LAST_LOG_REGION.store(base as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(stamp) = newest_sync_timestamp(chunk) {
+            newest = Some(newest.map_or(stamp, |best: f64| best.max(stamp)));
+        }
+        found += 1;
+        if found == 2 {
+            break;
+        }
+    }
+    if found == 0 {
+        eprintln!("[log] no in-memory log buffer found; sync markers come from the EE.log tail only");
+    }
+    newest
+}
+
+/// True when the game has logged an inventory sync that no previous probe has
+/// reported, read from the log text in memory rather than from `EE.log`.
+///
+/// Complements the file tail rather than replacing it: this sees the line as
+/// soon as the game formats it, whereas the tail sees it only after a flush,
+/// but the tail keeps working when the buffers cannot be located.
+#[cfg(target_os = "linux")]
+pub fn probe_inventory_sync_marker() -> bool {
+    let Some(pid) = find_warframe_pid_pub() else { return false };
+    let Ok(process) = LinuxProcess::open(pid) else { return false };
+    let Ok(regions) = linux_process_regions(pid) else { return false };
+    sync_marker_is_new(linux_newest_sync_timestamp(&process, &regions))
+}
+
+#[cfg(target_os = "windows")]
+pub fn probe_inventory_sync_marker() -> bool {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, FALSE},
+        System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
+    };
+
+    let Some(pid) = find_warframe_pid_pub() else { return false };
+    let process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid) };
+    if process == 0 {
+        return false;
+    }
+    let newest = windows_newest_sync_timestamp(process);
+    unsafe { CloseHandle(process) };
+    sync_marker_is_new(newest)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub fn probe_inventory_sync_marker() -> bool { false }
+
 // ─── Continuous raw memory string dump ───────────────────────────────────────
 //
 // Scans every committed readable region in the Warframe process and extracts
@@ -2915,6 +3232,57 @@ mod blob_digest_tests {
         assert!(!blob_unchanged(&garbage), "first sighting reports changed");
         forget_blob_digest();
         assert!(!blob_unchanged(&garbage), "same bytes report changed again after a failed parse");
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod sync_marker_tests {
+    use super::{looks_like_log_buffer, newest_sync_timestamp, reset_log_region, sync_marker_is_new};
+
+    /// The heap ring uses LF, the pending file-write buffer CRLF, and the
+    /// marker has to be found in either.
+    #[test]
+    fn marker_is_read_from_both_buffer_shapes() {
+        let ring = b"19760.121 Sys [Info]: SyncInventoryFromDB\n\
+                     19761.848 Sys [Info]: OnInventoryResults completed in 339ms\n";
+        assert_eq!(newest_sync_timestamp(ring), Some(19761.848));
+
+        let pending = b"19760.121 Sys [Info]: SyncInventoryFromDB\r\n\
+                        19761.848 Sys [Info]: OnInventoryResults completed in 339ms\r\n";
+        assert_eq!(newest_sync_timestamp(pending), Some(19761.848));
+    }
+
+    /// The ring wraps, so the newest line is not the one at the highest
+    /// address. Taking the last match would report an already-seen sync.
+    #[test]
+    fn newest_marker_wins_regardless_of_position() {
+        let wrapped = b"19999.500 Sys [Info]: OnInventoryResults completed in 41ms\n\
+                        11000.000 Sys [Info]: OnInventoryResults completed in 88ms\n";
+        assert_eq!(newest_sync_timestamp(wrapped), Some(19999.500));
+    }
+
+    /// `OnInventoryResults completed in` also exists as a read-only format
+    /// string, which carries no timestamp and must not be mistaken for a line
+    /// the game actually wrote.
+    #[test]
+    fn format_string_without_a_timestamp_is_not_a_marker() {
+        assert_eq!(newest_sync_timestamp(b"OnInventoryResults completed in %dms\0"), None);
+        assert!(!looks_like_log_buffer(b"Sys [Info]: %s\0 Sys [Info]: %s\0"));
+        assert!(looks_like_log_buffer(b"19761.848 Sys [Info]: Revive completed on KubrowPetAvatar14482\n"));
+    }
+
+    #[test]
+    fn baseline_reports_only_unseen_syncs() {
+        reset_log_region();
+        assert!(!sync_marker_is_new(Some(100.000)), "the first probe only takes a baseline");
+        assert!(!sync_marker_is_new(Some(100.000)), "the same sync must not report twice");
+        assert!(sync_marker_is_new(Some(140.250)), "a later sync reports");
+        // Seconds since launch, so a stamp running backwards means the client
+        // restarted; ignoring it would swallow markers until the new session
+        // outran the old one.
+        assert!(sync_marker_is_new(Some(12.500)), "a restarted client reports again");
+        assert!(!sync_marker_is_new(None), "no marker in the buffer reports nothing");
+        reset_log_region();
     }
 }
 
