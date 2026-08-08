@@ -1549,32 +1549,9 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
     const PAGE_EXECUTE_WC:   u32 = 0x80;
     const EXEC_MASK: u32 = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_RW | PAGE_EXECUTE_WC;
 
-    // ── Fast path: try the cached region from last successful scan ─────────────
-    // Saving blobs is a debugging path that wants every copy in memory, so it
-    // always takes the full walk.
-    if !save {
-        match scan_windows_cached_blob(process) {
-            Some(CachedBlobScan::Fresh(address, inventory)) => {
-                eprintln!("[blob] fast-path hit at 0x{:012x}: {} unique, {} stackable",
-                    address, inventory.unique_items.len(), inventory.stackable_items.len());
-                blob_tx.send(inventory).ok();
-                unsafe { CloseHandle(process); }
-                return 0; // fast path never saves to disk
-            }
-            Some(CachedBlobScan::Unchanged) => {
-                unsafe { CloseHandle(process); }
-                return 0;
-            }
-            // Cache miss: fall through to full walk and update the cache when found
-            None => {
-                let cached_addr = LAST_BLOB_REGION.load(std::sync::atomic::Ordering::Relaxed);
-                if cached_addr != 0 {
-                    eprintln!("[blob] fast-path miss at 0x{cached_addr:012x}, doing full walk");
-                }
-            }
-        }
-    }
-
+    // No fast path here on purpose. See the Linux arm: the monitor already ran
+    // that scan in `probe_tick` and escalated on the result, so repeating it
+    // here would answer the same and skip the walk it asked for.
     struct ActiveScan {
         data: Vec<u8>,
         id: usize,
@@ -2254,20 +2231,11 @@ pub fn capture_all_blobs(
         }
     };
 
-    // Saving blobs is a debugging path that wants every copy in memory, so it
-    // always takes the full walk.
-    if !save {
-        match scan_linux_cached_blob(&process, &regions) {
-            Some(CachedBlobScan::Fresh(address, inventory)) => {
-                eprintln!("[blob] Linux cached-region hit at 0x{address:012x}");
-                blob_tx.send(inventory).ok();
-                return 0;
-            }
-            Some(CachedBlobScan::Unchanged) => return 0,
-            None => {} // cache miss — fall through to the full walk below
-        }
-    }
-
+    // No fast path here on purpose. The only caller is the monitor, which
+    // reaches this after `probe_tick` already ran that scan and decided the
+    // answer was worth a walk. Re-running it returns the same verdict and skips
+    // the walk just asked for, so the `Unchanged`-plus-sync escalation never
+    // walks at all.
     let mut found = 0;
     let mut saved = 0;
     let unchanged = scan_linux_inventory_regions(&process, regions, save, |address, raw, inventory| {
