@@ -1997,8 +1997,9 @@ fn scan_linux_inventory_regions(
         // The chain-reconstruction below assumes every mapping in `prefix`
         // precedes `chunk` in address order, which only holds because the
         // caller walks regions ascending. Reordering to reach the blob sooner
-        // is not worth the rework: it already turns up in the first quarter of
-        // the ascending walk, so a high-address-first pass would read *more*.
+        // has no fixed target to aim at: observed copies range from a quarter
+        // of the way through the mappings to the very top of the address
+        // space, so no ordering is reliably better than another.
         if start_offset.is_none() && !is_mission && has_prefix {
             while prefix.iter().map(|item| item.data.len()).sum::<usize>() + read > PREFIX_BYTES
                 && !prefix.is_empty()
@@ -2117,11 +2118,12 @@ fn scan_linux_inventory_regions(
 /// Re-read the blob straight from the address the last successful scan found it
 /// at, stitching forward through following mappings until the JSON closes.
 ///
-/// The full walk reads several gigabytes to reach the blob, which sits in the
-/// first quarter of the ascending walk — measured at 14.8%, 16.0%, 23.6% and
-/// 23.7% of mapped bytes across four core dumps of two clients. Because the
-/// game rarely moves the allocation between scans, probing the remembered
-/// address first turns the common case into a few megabytes of reads.
+/// The full walk reads several gigabytes to reach the blob, and where it turns
+/// up is not stable: core dumps of one client put every copy between 24% and
+/// 46% of mapped bytes, while a live session was found at 0x7fffedad0011,
+/// after the walk had read all 2 GB. Because the game rarely moves the
+/// allocation between scans, probing the remembered address first turns the
+/// common case into a few megabytes of reads regardless of where it landed.
 ///
 /// Returns `None` whenever anything looks different from last time, which puts
 /// the caller back on the full walk rather than reporting a stale inventory.
