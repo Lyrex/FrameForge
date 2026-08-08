@@ -2321,41 +2321,69 @@ fn probe_outcome(
     }
 }
 
-/// Re-read the blob from its remembered address without ever falling back to a
-/// full region walk.
+/// One monitor tick: re-read the blob from its remembered address, and check
+/// whether the game has logged an inventory sync since the last tick.
 ///
-/// `capture_all_blobs` runs the same fast path but escalates to the walk on a
-/// miss, which makes it unusable as a poll: probing at 1-2 Hz would mean
-/// walking memory at 1-2 Hz for as long as the cached address stays stale.
-/// Splitting the two lets the caller poll cheaply and decide for itself when a
-/// miss is worth the walk.
+/// Never falls back to a full region walk. `capture_all_blobs` does that, which
+/// makes it unusable as a poll: probing at 1-2 Hz would mean walking memory at
+/// 1-2 Hz for as long as the cached address stays stale. Splitting the two lets
+/// the caller poll cheaply and decide for itself when a miss is worth the walk.
+///
+/// Both answers come from one process handle and one region list because the
+/// caller always wants both, and on Linux acquiring them means re-parsing a
+/// maps file with thousands of entries.
+///
+/// The marker is read first and every tick, because it is what tells the blob
+/// scan it has something to look at. The scan itself runs only when `force` or
+/// that marker says so; between syncs it can only ever conclude that nothing
+/// moved. `None` means it was not scanned this tick, which is not the same as
+/// a miss.
 #[cfg(target_os = "linux")]
-pub fn probe_cached_blob(blob_tx: std::sync::mpsc::Sender<BlobInventory>) -> ScanOutcome {
-    let Some(pid) = find_warframe_pid_pub() else { return ScanOutcome::CacheMiss };
-    let Ok(process) = LinuxProcess::open(pid) else { return ScanOutcome::CacheMiss };
-    let Ok(regions) = linux_process_regions(pid) else { return ScanOutcome::CacheMiss };
-    probe_outcome(scan_linux_cached_blob(&process, &regions), &blob_tx)
+pub fn probe_tick(
+    pid: u32,
+    blob_tx: std::sync::mpsc::Sender<BlobInventory>,
+    force: bool,
+) -> (Option<ScanOutcome>, bool) {
+    let Ok(process) = LinuxProcess::open(pid) else { return (None, false) };
+    let Ok(regions) = linux_process_regions(pid) else { return (None, false) };
+    let sync = sync_marker_is_new(linux_newest_sync_timestamp(&process, &regions));
+    if !(force || sync) {
+        return (None, sync);
+    }
+    let outcome = probe_outcome(scan_linux_cached_blob(&process, &regions), &blob_tx);
+    (Some(outcome), sync)
 }
 
 #[cfg(target_os = "windows")]
-pub fn probe_cached_blob(blob_tx: std::sync::mpsc::Sender<BlobInventory>) -> ScanOutcome {
+pub fn probe_tick(
+    pid: u32,
+    blob_tx: std::sync::mpsc::Sender<BlobInventory>,
+    force: bool,
+) -> (Option<ScanOutcome>, bool) {
     use windows_sys::Win32::{
         Foundation::{CloseHandle, FALSE},
         System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
     };
 
-    let Some(pid) = find_warframe_pid_pub() else { return ScanOutcome::CacheMiss };
     let process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid) };
     if process == 0 {
-        return ScanOutcome::CacheMiss;
+        return (None, false);
     }
-    let outcome = probe_outcome(scan_windows_cached_blob(process), &blob_tx);
+    let sync = sync_marker_is_new(windows_newest_sync_timestamp(process));
+    let outcome = (force || sync)
+        .then(|| probe_outcome(scan_windows_cached_blob(process), &blob_tx));
     unsafe { CloseHandle(process) };
-    outcome
+    (outcome, sync)
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-pub fn probe_cached_blob(_blob_tx: std::sync::mpsc::Sender<BlobInventory>) -> ScanOutcome { ScanOutcome::CacheMiss }
+pub fn probe_tick(
+    _pid: u32,
+    _blob_tx: std::sync::mpsc::Sender<BlobInventory>,
+    _force: bool,
+) -> (Option<ScanOutcome>, bool) {
+    (None, false)
+}
 
 // ─── Inventory-sync marker, read from memory rather than from EE.log ──────────
 //
@@ -2393,6 +2421,29 @@ const MAX_LOG_REGION: usize = 16 * 1024 * 1024;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 static LAST_LOG_REGION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Probes still to skip before the cold search may run again.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+static LOG_SEARCH_BACKOFF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the cold search is allowed to run on this probe. That search reads
+/// every non-executable mapping under [`MAX_LOG_REGION`], hundreds of MB.
+///
+/// Without this, a client whose log buffers cannot be located pays a walk-sized
+/// read on the monitor thread every couple of seconds for the whole session.
+/// Backing off costs only latency: the marker is an optimisation, and the
+/// EE.log tail reports the same syncs meanwhile.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn cold_log_search_due() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    LOG_SEARCH_BACKOFF
+        .fetch_update(Relaxed, Relaxed, |left| Some(left.saturating_sub(1)))
+        .is_ok_and(|left| left == 0)
+}
+
+/// Probes to sit out after a failed cold search, at the monitor's 2 s cadence.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const LOG_SEARCH_BACKOFF_PROBES: u64 = 30;
+
 /// Game timestamp of the newest sync marker already reported, as `f64` bits.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 static LAST_SYNC_TIMESTAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2405,6 +2456,7 @@ static LAST_SYNC_TIMESTAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 pub fn reset_log_region() {
     LAST_LOG_REGION.store(0, std::sync::atomic::Ordering::Relaxed);
     LAST_SYNC_TIMESTAMP.store(0, std::sync::atomic::Ordering::Relaxed);
+    LOG_SEARCH_BACKOFF.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -2531,6 +2583,10 @@ fn linux_newest_sync_timestamp(process: &LinuxProcess, regions: &[LinuxRegion]) 
         LAST_LOG_REGION.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
+    if !cold_log_search_due() {
+        return None;
+    }
+
     // Cold search. There are two copies of the log text: the pending
     // file-write buffer and a heap ring of recent lines. Which one is
     // further ahead depends on where the game is in its flush cycle, so both
@@ -2560,6 +2616,7 @@ fn linux_newest_sync_timestamp(process: &LinuxProcess, regions: &[LinuxRegion]) 
     }
     if found == 0 {
         eprintln!("[log] no in-memory log buffer found; sync markers come from the EE.log tail only");
+        LOG_SEARCH_BACKOFF.store(LOG_SEARCH_BACKOFF_PROBES, std::sync::atomic::Ordering::Relaxed);
     }
     newest
 }
@@ -2613,6 +2670,10 @@ fn windows_newest_sync_timestamp(process: windows_sys::Win32::Foundation::HANDLE
         LAST_LOG_REGION.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
+    if !cold_log_search_due() {
+        return None;
+    }
+
     // Cold search. There are two copies of the log text: the pending
     // file-write buffer and a heap ring of recent lines. Which one is
     // further ahead depends on where the game is in its flush cycle, so both
@@ -2647,43 +2708,10 @@ fn windows_newest_sync_timestamp(process: windows_sys::Win32::Foundation::HANDLE
     }
     if found == 0 {
         eprintln!("[log] no in-memory log buffer found; sync markers come from the EE.log tail only");
+        LOG_SEARCH_BACKOFF.store(LOG_SEARCH_BACKOFF_PROBES, std::sync::atomic::Ordering::Relaxed);
     }
     newest
 }
-
-/// True when the game has logged an inventory sync that no previous probe has
-/// reported, read from the log text in memory rather than from `EE.log`.
-///
-/// Complements the file tail rather than replacing it: this sees the line as
-/// soon as the game formats it, whereas the tail sees it only after a flush,
-/// but the tail keeps working when the buffers cannot be located.
-#[cfg(target_os = "linux")]
-pub fn probe_inventory_sync_marker() -> bool {
-    let Some(pid) = find_warframe_pid_pub() else { return false };
-    let Ok(process) = LinuxProcess::open(pid) else { return false };
-    let Ok(regions) = linux_process_regions(pid) else { return false };
-    sync_marker_is_new(linux_newest_sync_timestamp(&process, &regions))
-}
-
-#[cfg(target_os = "windows")]
-pub fn probe_inventory_sync_marker() -> bool {
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, FALSE},
-        System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
-    };
-
-    let Some(pid) = find_warframe_pid_pub() else { return false };
-    let process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid) };
-    if process == 0 {
-        return false;
-    }
-    let newest = windows_newest_sync_timestamp(process);
-    unsafe { CloseHandle(process) };
-    sync_marker_is_new(newest)
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
-pub fn probe_inventory_sync_marker() -> bool { false }
 
 // ─── Continuous raw memory string dump ───────────────────────────────────────
 //
@@ -3298,7 +3326,34 @@ mod blob_digest_tests {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
 mod sync_marker_tests {
-    use super::{looks_like_log_buffer, newest_sync_timestamp, reset_log_region, sync_marker_is_new};
+    use super::{
+        cold_log_search_due, looks_like_log_buffer, newest_sync_timestamp, reset_log_region,
+        sync_marker_is_new, LOG_SEARCH_BACKOFF, LOG_SEARCH_BACKOFF_PROBES,
+    };
+
+    // LAST_SYNC_TIMESTAMP and LOG_SEARCH_BACKOFF are process-global, and
+    // reset_log_region clears both at once, so a test calling it races any
+    // other test mid-sequence. Every test here that resets takes this lock.
+    static LOG_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_failed_cold_search_sits_out_the_next_probes() {
+        let _guard = LOG_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_log_region();
+        assert!(cold_log_search_due(), "the first search runs");
+
+        LOG_SEARCH_BACKOFF.store(LOG_SEARCH_BACKOFF_PROBES, std::sync::atomic::Ordering::Relaxed);
+        for probe in 0..LOG_SEARCH_BACKOFF_PROBES {
+            assert!(!cold_log_search_due(), "probe {probe} searched during the backoff");
+        }
+        assert!(cold_log_search_due(), "the search resumes once the backoff expires");
+
+        // A PID change clears it: the new client's buffers are worth looking for
+        // straight away.
+        LOG_SEARCH_BACKOFF.store(LOG_SEARCH_BACKOFF_PROBES, std::sync::atomic::Ordering::Relaxed);
+        reset_log_region();
+        assert!(cold_log_search_due());
+    }
 
     /// The heap ring uses LF, the pending file-write buffer CRLF, and the
     /// marker has to be found in either.
@@ -3334,6 +3389,7 @@ mod sync_marker_tests {
 
     #[test]
     fn baseline_reports_only_unseen_syncs() {
+        let _guard = LOG_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_log_region();
         assert!(sync_marker_is_new(Some(100.000)), "the first marker seen is not yet reported");
         assert!(!sync_marker_is_new(Some(100.000)), "the same sync must not report twice");
@@ -3351,6 +3407,7 @@ mod sync_marker_tests {
     /// first observation on a baseline would drop it on every restart.
     #[test]
     fn login_sync_after_a_restart_is_reported() {
+        let _guard = LOG_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_log_region();
         assert!(sync_marker_is_new(Some(9821.400)), "a marker from the previous client");
         reset_log_region();
