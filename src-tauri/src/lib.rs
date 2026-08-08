@@ -5091,7 +5091,11 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                         blob_sync_pending.store(false, Ordering::SeqCst);
                     }
                     if should_capture {
-                        eprintln!("[monitor] escalating to full walk (outcome={outcome:?} sync_marker={sync_seen})");
+                        eprintln!("[monitor] escalating to full walk (outcome={outcome:?} sync_marker={sync_seen} since_last_walk={})",
+                            match last_walk_time {
+                                Some(t) => format!("{:.1}s", t.elapsed().as_secs_f64()),
+                                None => "never".into(),
+                            });
                     }
                 }
 

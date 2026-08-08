@@ -2485,18 +2485,22 @@ fn newest_sync_timestamp(chunk: &[u8]) -> Option<f64> {
 /// Fold a freshly-observed marker timestamp into the baseline, reporting
 /// whether it names a sync that has not been reported yet.
 ///
-/// A timestamp *older* than the baseline counts as new: the stamps are seconds
-/// since the client launched, so the only way they run backwards is a game
-/// restart, and the alternative is ignoring every marker until the new client
-/// has been up as long as the old one was.
+/// Any difference from the baseline counts, in both directions. The stamps are
+/// seconds since the client launched, so the only way they run backwards is a
+/// game restart, and the sync logged just after one is the login sync that
+/// populates the inventory.
+///
+/// The first observation counts too, rather than being spent establishing a
+/// baseline. A buffer that already holds markers at app start is reporting
+/// history, but reporting it costs nothing, because the first capture walks
+/// memory unconditionally and nothing reads the marker on that tick. Spending
+/// the first observation would instead swallow the login sync after every
+/// restart, since the PID change clears the baseline right before it arrives.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn sync_marker_is_new(newest: Option<f64>) -> bool {
     let Some(newest) = newest else { return false };
     let previous = f64::from_bits(LAST_SYNC_TIMESTAMP.swap(newest.to_bits(), std::sync::atomic::Ordering::Relaxed));
-    // The first probe only establishes the baseline. Reporting the markers
-    // already in the buffer at startup would be reporting history: the first
-    // capture walks memory unconditionally anyway.
-    previous != 0.0 && newest != previous
+    newest != previous
 }
 
 /// Newest sync-marker timestamp currently in the game's log buffers, probing
@@ -3274,7 +3278,7 @@ mod sync_marker_tests {
     #[test]
     fn baseline_reports_only_unseen_syncs() {
         reset_log_region();
-        assert!(!sync_marker_is_new(Some(100.000)), "the first probe only takes a baseline");
+        assert!(sync_marker_is_new(Some(100.000)), "the first marker seen is not yet reported");
         assert!(!sync_marker_is_new(Some(100.000)), "the same sync must not report twice");
         assert!(sync_marker_is_new(Some(140.250)), "a later sync reports");
         // Seconds since launch, so a stamp running backwards means the client
@@ -3283,6 +3287,17 @@ mod sync_marker_tests {
         assert!(sync_marker_is_new(Some(12.500)), "a restarted client reports again");
         assert!(!sync_marker_is_new(None), "no marker in the buffer reports nothing");
         reset_log_region();
+    }
+
+    /// The PID change that clears the baseline lands moments before the login
+    /// sync, which is the marker the gate is there to catch. Spending the
+    /// first observation on a baseline would drop it on every restart.
+    #[test]
+    fn login_sync_after_a_restart_is_reported() {
+        reset_log_region();
+        assert!(sync_marker_is_new(Some(9821.400)), "a marker from the previous client");
+        reset_log_region();
+        assert!(sync_marker_is_new(Some(13.036)), "the new client's login sync must report");
     }
 }
 
