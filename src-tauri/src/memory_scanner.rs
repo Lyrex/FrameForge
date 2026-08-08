@@ -2291,6 +2291,78 @@ pub fn capture_all_blobs(
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub fn capture_all_blobs(_blob_dir: &std::path::Path, _ts: &str, _blob_tx: std::sync::mpsc::Sender<BlobInventory>, _save: bool) -> usize { 0 }
 
+// ─── Cheap probe ──────────────────────────────────────────────────────────────
+
+/// What a probe of the cached blob address concluded.
+///
+/// `Unchanged` and `Updated` are definitive answers obtained for a few
+/// megabytes of reads. `CacheMiss` is not: the game may have reallocated the
+/// blob because the inventory changed, or the address may be stale for some
+/// unrelated reason, and telling those apart costs a full region walk.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScanOutcome {
+    /// Cached address hit, bytes identical to the last cycle.
+    Unchanged,
+    /// Blob parsed and sent through `blob_tx`.
+    Updated,
+    /// Cached address absent, stale, or unparseable.
+    CacheMiss,
+}
+
+/// Map a cached-region scan onto a probe outcome, sending any fresh inventory.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn probe_outcome(
+    scan: Option<CachedBlobScan>,
+    blob_tx: &std::sync::mpsc::Sender<BlobInventory>,
+) -> ScanOutcome {
+    match scan {
+        Some(CachedBlobScan::Fresh(address, inventory)) => {
+            eprintln!("[blob] probe hit at 0x{address:012x}: {} unique, {} stackable",
+                inventory.unique_items.len(), inventory.stackable_items.len());
+            blob_tx.send(inventory).ok();
+            ScanOutcome::Updated
+        }
+        Some(CachedBlobScan::Unchanged) => ScanOutcome::Unchanged,
+        None => ScanOutcome::CacheMiss,
+    }
+}
+
+/// Re-read the blob from its remembered address without ever falling back to a
+/// full region walk.
+///
+/// `capture_all_blobs` runs the same fast path but escalates to the walk on a
+/// miss, which makes it unusable as a poll: probing at 1-2 Hz would mean
+/// walking memory at 1-2 Hz for as long as the cached address stays stale.
+/// Splitting the two lets the caller poll cheaply and decide for itself when a
+/// miss is worth the walk.
+#[cfg(target_os = "linux")]
+pub fn probe_cached_blob(blob_tx: std::sync::mpsc::Sender<BlobInventory>) -> ScanOutcome {
+    let Some(pid) = find_warframe_pid_pub() else { return ScanOutcome::CacheMiss };
+    let Ok(process) = LinuxProcess::open(pid) else { return ScanOutcome::CacheMiss };
+    let Ok(regions) = linux_process_regions(pid) else { return ScanOutcome::CacheMiss };
+    probe_outcome(scan_linux_cached_blob(&process, &regions), &blob_tx)
+}
+
+#[cfg(target_os = "windows")]
+pub fn probe_cached_blob(blob_tx: std::sync::mpsc::Sender<BlobInventory>) -> ScanOutcome {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, FALSE},
+        System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
+    };
+
+    let Some(pid) = find_warframe_pid_pub() else { return ScanOutcome::CacheMiss };
+    let process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid) };
+    if process == 0 {
+        return ScanOutcome::CacheMiss;
+    }
+    let outcome = probe_outcome(scan_windows_cached_blob(process), &blob_tx);
+    unsafe { CloseHandle(process) };
+    outcome
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub fn probe_cached_blob(_blob_tx: std::sync::mpsc::Sender<BlobInventory>) -> ScanOutcome { ScanOutcome::CacheMiss }
+
 // ─── Continuous raw memory string dump ───────────────────────────────────────
 //
 // Scans every committed readable region in the Warframe process and extracts
@@ -2957,6 +3029,53 @@ mod linux_tests {
         unsafe {
             libc::munmap(mapped, page * 2);
         }
+    }
+
+    /// The probe answers without walking memory, so what matters is that each
+    /// cached-region result maps onto the outcome the caller's escalation
+    /// policy keys off, and that only `Updated` puts an inventory on the
+    /// channel.
+    #[test]
+    fn probe_outcomes_distinguish_fresh_unchanged_and_miss() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut data = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#.to_vec();
+        data.resize(64_000, b' ');
+        data.extend_from_slice(br#""DeathSquadable":false}"#);
+        data.resize(128_000, 0);
+        let regions = vec![LinuxRegion {
+            start: data.as_ptr() as usize,
+            len: data.len(),
+            executable: false, ..Default::default() }];
+        let process = LinuxProcess::open(std::process::id()).expect("current process is readable");
+        let (blob_tx, blob_rx) = std::sync::mpsc::channel();
+
+        reset_last_blob_region();
+        LAST_BLOB_REGION.store(data.as_ptr() as u64, std::sync::atomic::Ordering::Relaxed);
+        let probe = |scan| probe_outcome(scan, &blob_tx);
+
+        assert_eq!(probe(scan_linux_cached_blob(&process, &regions)), ScanOutcome::Updated);
+        assert_eq!(blob_rx.try_recv().expect("a fresh blob is sent on").credits, 42);
+
+        assert_eq!(probe(scan_linux_cached_blob(&process, &regions)), ScanOutcome::Unchanged);
+        assert!(blob_rx.try_recv().is_err(), "unchanged bytes must not re-send the inventory");
+
+        // A mission reward delta shares the blob's field names but describes a
+        // single mission, so it must read as a miss rather than as inventory.
+        let mut delta = br#"{"InventoryChanges":{"MiscItems":[],"SubscribedToEmails":true,"#.to_vec();
+        delta.resize(64_000, b' ');
+        delta.extend_from_slice(br#""DeathSquadable":false}"#);
+        let delta_regions = vec![LinuxRegion {
+            start: delta.as_ptr() as usize,
+            len: delta.len(),
+            executable: false, ..Default::default() }];
+        LAST_BLOB_REGION.store(delta.as_ptr() as u64, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(probe(scan_linux_cached_blob(&process, &delta_regions)), ScanOutcome::CacheMiss);
+
+        LAST_BLOB_REGION.store(data.as_ptr() as u64 + 8, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(probe(scan_linux_cached_blob(&process, &regions)), ScanOutcome::CacheMiss);
+        assert!(blob_rx.try_recv().is_err(), "a miss must not send anything");
+
+        reset_last_blob_region();
     }
 
     #[test]
