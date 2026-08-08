@@ -1325,6 +1325,15 @@ static LAST_BLOB_REGION: std::sync::atomic::AtomicU64 =
 // HashMaps/Vecs from scratch every cycle.
 static LAST_BLOB_DIGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Outcome of probing the cached region address: either the bytes changed and
+/// were reparsed, or they're identical to what the previous cycle already
+/// sent and there's nothing new to do.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+enum CachedBlobScan {
+    Fresh(usize, BlobInventory),
+    Unchanged,
+}
+
 /// Clear the fast-path region cache. Call when Warframe's PID changes so the
 /// next scan doesn't probe a stale address from the previous process instance.
 pub fn reset_last_blob_region() {
@@ -1383,6 +1392,114 @@ fn blob_unchanged(json: &[u8]) -> bool {
 ///      The walk always continues through all of memory — every blob start is found.
 ///   5. Drop any scan that grows past MAX_SCAN_BYTES without finding the end.
 ///
+// Shared by the cold walk and the cached-region fast path, so a region
+// rejected as a mission delta or a scan dropped for growing past the cap
+// means the same thing in either place.
+#[cfg(target_os = "windows")]
+const MAX_READ: usize = 64 * 1024 * 1024;
+#[cfg(target_os = "windows")]
+const MAX_SCAN: usize = 20 * 1024 * 1024;
+#[cfg(target_os = "windows")]
+const MISSION_DELTA: &[u8] = b"\"InventoryChanges\":";
+#[cfg(target_os = "windows")]
+const LOTUS_KEY: &[u8] = b"/Lotus/";
+#[cfg(target_os = "windows")]
+const ANCHORS: &[&[u8]] = &[
+    b"\"SubscribedToEmails\"",
+    b"\"MiscItems\":[",
+    b"\"Suits\":[",
+    b"\"LongGuns\":[",
+    b"\"Melee\":[",
+    b"\"Pistols\":[",
+];
+
+/// Re-read the blob straight from the address the last successful scan found
+/// it at, stitching forward through following regions until the JSON closes.
+///
+/// The Windows counterpart to `scan_linux_cached_blob`: the full walk reads
+/// gigabytes to reach a blob the game rarely moves between cycles, so probing
+/// the remembered address first turns the common case into a few megabytes.
+///
+/// Returns `None` whenever anything looks different from last time, which puts
+/// the caller back on the full walk rather than reporting a stale inventory.
+#[cfg(target_os = "windows")]
+fn scan_windows_cached_blob(process: windows_sys::Win32::Foundation::HANDLE) -> Option<CachedBlobScan> {
+    use std::ffi::c_void;
+    use std::mem;
+    use windows_sys::Win32::System::{
+        Diagnostics::Debug::ReadProcessMemory,
+        Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS},
+    };
+
+    let cached_addr = LAST_BLOB_REGION.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    if cached_addr == 0 {
+        return None;
+    }
+
+    let mut mbi = unsafe { mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
+    let ok = unsafe { VirtualQueryEx(process, cached_addr as *const c_void, &mut mbi,
+        mem::size_of::<MEMORY_BASIC_INFORMATION>()) } != 0;
+    if !ok || mbi.State != MEM_COMMIT
+        || mbi.Protect & PAGE_GUARD != 0
+        || mbi.Protect & PAGE_NOACCESS != 0
+    {
+        return None;
+    }
+
+    let read_cap = mbi.RegionSize.min(MAX_READ);
+    let mut buf = vec![0u8; read_cap];
+    let mut n = 0usize;
+    let read_ok = unsafe { ReadProcessMemory(process, cached_addr as *const c_void,
+        buf.as_mut_ptr() as *mut c_void, read_cap, &mut n) } != 0 && n >= 8;
+    if !read_ok {
+        return None;
+    }
+
+    let chunk = &buf[..n];
+    let is_mission = chunk.windows(MISSION_DELTA.len()).any(|w| w == MISSION_DELTA);
+    let has_anchor = ANCHORS.iter().any(|a| chunk.windows(a.len()).any(|w| w == *a));
+    let has_lotus  = chunk.windows(LOTUS_KEY.len()).any(|w| w == LOTUS_KEY);
+    // cached_addr is the exact byte of the blob's outer {, so seed from byte 0.
+    // Accept regions that are blob data even when SubscribedToEmails is in a
+    // later region (field order varies by account).
+    if is_mission || !(has_anchor || has_lotus) || !chunk.starts_with(b"{\"") {
+        return None;
+    }
+
+    let mut stitched = chunk.to_vec();
+    let mut walk = cached_addr + n;
+    while stitched.len() < MAX_SCAN && find_blob_end(&stitched).is_none() {
+        let mut nmbi = unsafe { mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
+        if unsafe { VirtualQueryEx(process, walk as *const c_void, &mut nmbi,
+            mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 { break; }
+        let nr = nmbi.BaseAddress as usize;
+        let ns = nmbi.RegionSize;
+        walk = nr + ns;
+        if nmbi.State != MEM_COMMIT
+            || nmbi.Protect & PAGE_GUARD != 0
+            || nmbi.Protect & PAGE_NOACCESS != 0
+            || ns == 0 { continue; }
+        let cap = ns.min(MAX_READ);
+        let mut nb = vec![0u8; cap];
+        let mut nn = 0usize;
+        if unsafe { ReadProcessMemory(process, nr as *const c_void,
+            nb.as_mut_ptr() as *mut c_void, cap, &mut nn) } == 0 { continue; }
+        stitched.extend_from_slice(&nb[..nn]);
+    }
+
+    if blob_unchanged(&stitched) {
+        eprintln!("[blob] fast-path hit at 0x{cached_addr:012x}: unchanged since last scan — skipping parse");
+        return Some(CachedBlobScan::Unchanged);
+    }
+    match parse_full_account_blob(&stitched) {
+        Some(inventory) => Some(CachedBlobScan::Fresh(cached_addr, inventory)),
+        None => {
+            forget_blob_digest();
+            None
+        }
+    }
+}
+
 /// When `save=true` also writes the raw text to `blob_dir` for debugging.
 /// Returns the number of files written (always 0 when `save=false`).
 #[cfg(target_os = "windows")]
@@ -1403,8 +1520,6 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
     if process == 0 { return 0; }
 
     const MIN_REGION:    usize = 64_000;   // skip regions smaller than 64 KB
-    const MAX_READ:      usize = 64  * 1024 * 1024;
-    const MAX_SCAN:      usize = 20  * 1024 * 1024;
     const MAX_BLOBS:     usize = 25;
 
     // Executable pages never contain heap data — safe to skip.
@@ -1414,80 +1529,30 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
     const PAGE_EXECUTE_WC:   u32 = 0x80;
     const EXEC_MASK: u32 = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_RW | PAGE_EXECUTE_WC;
 
-    const MISSION_DELTA: &[u8] = b"\"InventoryChanges\":";
-    const LOTUS_KEY:     &[u8] = b"/Lotus/";
-    const ANCHORS: &[&[u8]] = &[
-        b"\"SubscribedToEmails\"",
-        b"\"MiscItems\":[",
-        b"\"Suits\":[",
-        b"\"LongGuns\":[",
-        b"\"Melee\":[",
-        b"\"Pistols\":[",
-    ];
-
     // ── Fast path: try the cached region from last successful scan ─────────────
-    // If the blob is still at the same address, we skip the entire memory walk.
-    let cached_addr = LAST_BLOB_REGION.load(std::sync::atomic::Ordering::Relaxed) as usize;
-    if cached_addr != 0 && !save {
-        let mut mbi = unsafe { mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
-        let ok = unsafe { VirtualQueryEx(process, cached_addr as *const c_void, &mut mbi,
-            mem::size_of::<MEMORY_BASIC_INFORMATION>()) } != 0;
-        if ok && mbi.State == MEM_COMMIT
-            && mbi.Protect & PAGE_GUARD == 0
-            && mbi.Protect & PAGE_NOACCESS == 0
-        {
-            let read_cap = mbi.RegionSize.min(MAX_READ);
-            let mut buf = vec![0u8; read_cap];
-            let mut n = 0usize;
-            let read_ok = unsafe { ReadProcessMemory(process, cached_addr as *const c_void,
-                buf.as_mut_ptr() as *mut c_void, read_cap, &mut n) } != 0 && n >= 8;
-            if read_ok {
-                let chunk = &buf[..n];
-                let is_mission = chunk.windows(MISSION_DELTA.len()).any(|w| w == MISSION_DELTA);
-                let has_anchor = ANCHORS.iter().any(|a| chunk.windows(a.len()).any(|w| w == *a));
-                let has_lotus  = chunk.windows(LOTUS_KEY.len()).any(|w| w == LOTUS_KEY);
-                // cached_addr is the exact byte of the blob's outer {, so seed from byte 0.
-                // Accept regions that are blob data even when SubscribedToEmails is in a
-                // later region (field order varies by account).
-                if !is_mission && (has_anchor || has_lotus) && chunk.starts_with(b"{\"") {
-                    let mut stitched = chunk.to_vec();
-                    let mut walk = cached_addr + n;
-                    while stitched.len() < MAX_SCAN && find_blob_end(&stitched).is_none() {
-                        let mut nmbi = unsafe { mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
-                        if unsafe { VirtualQueryEx(process, walk as *const c_void, &mut nmbi,
-                            mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 { break; }
-                        let nr = nmbi.BaseAddress as usize;
-                        let ns = nmbi.RegionSize;
-                        walk = nr + ns;
-                        if nmbi.State != MEM_COMMIT
-                            || nmbi.Protect & PAGE_GUARD != 0
-                            || nmbi.Protect & PAGE_NOACCESS != 0
-                            || ns == 0 { continue; }
-                        let cap = ns.min(MAX_READ);
-                        let mut nb = vec![0u8; cap];
-                        let mut nn = 0usize;
-                        if unsafe { ReadProcessMemory(process, nr as *const c_void,
-                            nb.as_mut_ptr() as *mut c_void, cap, &mut nn) } == 0 { continue; }
-                        stitched.extend_from_slice(&nb[..nn]);
-                    }
-                    if blob_unchanged(&stitched) {
-                        eprintln!("[blob] fast-path hit at 0x{:012x}: unchanged since last scan — skipping parse", cached_addr);
-                        unsafe { CloseHandle(process); }
-                        return 0;
-                    }
-                    if let Some(inv) = parse_full_account_blob(&stitched) {
-                        eprintln!("[blob] fast-path hit at 0x{:012x}: {} unique, {} stackable",
-                            cached_addr, inv.unique_items.len(), inv.stackable_items.len());
-                        blob_tx.send(inv).ok();
-                        unsafe { CloseHandle(process); }
-                        return 0; // fast path never saves to disk
-                    }
-                    forget_blob_digest();
+    // Saving blobs is a debugging path that wants every copy in memory, so it
+    // always takes the full walk.
+    if !save {
+        match scan_windows_cached_blob(process) {
+            Some(CachedBlobScan::Fresh(address, inventory)) => {
+                eprintln!("[blob] fast-path hit at 0x{:012x}: {} unique, {} stackable",
+                    address, inventory.unique_items.len(), inventory.stackable_items.len());
+                blob_tx.send(inventory).ok();
+                unsafe { CloseHandle(process); }
+                return 0; // fast path never saves to disk
+            }
+            Some(CachedBlobScan::Unchanged) => {
+                unsafe { CloseHandle(process); }
+                return 0;
+            }
+            // Cache miss: fall through to full walk and update the cache when found
+            None => {
+                let cached_addr = LAST_BLOB_REGION.load(std::sync::atomic::Ordering::Relaxed);
+                if cached_addr != 0 {
+                    eprintln!("[blob] fast-path miss at 0x{cached_addr:012x}, doing full walk");
                 }
             }
         }
-        // Cache miss — fall through to full walk and update the cache when found
-        eprintln!("[blob] fast-path miss at 0x{:012x} — doing full walk", cached_addr);
     }
 
     struct ActiveScan {
@@ -2020,15 +2085,6 @@ fn scan_linux_inventory_regions(
         t_total.elapsed().as_secs_f64() * 1000.0,
     );
     outcome.unwrap_or(false)
-}
-
-/// Outcome of probing the cached region address: either the bytes changed and
-/// were reparsed, or they're identical to what the previous cycle already
-/// sent and there's nothing new to do.
-#[cfg(target_os = "linux")]
-enum CachedBlobScan {
-    Fresh(usize, BlobInventory),
-    Unchanged,
 }
 
 /// Re-read the blob straight from the address the last successful scan found it
