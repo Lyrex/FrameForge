@@ -1020,21 +1020,15 @@ pub fn compute_riven_mod_name(buffs: &[BlobRivenStat]) -> String {
 /// final region — potentially tens of megabytes of noise. This trims to just
 /// the valid JSON object so both the parser and the debug dump files see clean data.
 pub fn extract_blob_json(raw: &[u8]) -> Option<Vec<u8>> {
-    extract_blob_json_ref(raw).map(Cow::into_owned)
+    extract_blob_json_at(raw, find_blob_end(raw)?).map(Cow::into_owned)
 }
 
-/// Borrowing counterpart of [`extract_blob_json`]. The common case (buffer still
-/// starts with the original `{`) needs no copy at all; only the fallback path,
-/// where the opening brace was overwritten in memory and has to be reinstated,
-/// allocates.
-pub fn extract_blob_json_ref(raw: &[u8]) -> Option<Cow<'_, [u8]>> {
-    let end_pos = find_blob_end(raw)?;
-    extract_blob_json_at(raw, end_pos)
-}
-
-/// Same as [`extract_blob_json_ref`] but takes an already-known `end_pos`, so
-/// callers that located the blob end for their own purposes (e.g. the
-/// minimum-size check in [`parse_full_account_blob`]) don't pay for a second scan.
+/// Borrowing form taking an already-known `end_pos`, so callers that located the
+/// blob end for their own purposes (e.g. the minimum-size check in
+/// [`parse_full_account_blob`]) don't pay for a second scan. The common case
+/// (buffer still starts with the original `{`) needs no copy at all; only the
+/// fallback, where the opening brace was overwritten in memory and has to be
+/// reinstated, allocates.
 fn extract_blob_json_at(raw: &[u8], end_pos: usize) -> Option<Cow<'_, [u8]>> {
     if raw.first() == Some(&b'{') {
         Some(Cow::Borrowed(&raw[..end_pos]))
@@ -1159,12 +1153,7 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
                 });
                 continue;
             }
-            // Duplicate ItemTypes dominate this map, so check get_mut before
-            // paying for entry()'s unconditional to_string() allocation.
-            let mc = match mods.get_mut(it) {
-                Some(mc) => mc,
-                None => mods.entry(it.to_string()).or_default(),
-            };
+            let mc = blob_entry(&mut mods, it);
             *mc.by_rank.entry(0).or_insert(0) += count;
             mc.total += count;
         }
@@ -1225,10 +1214,7 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
                 }
             }
             let rank = blob_extract_mod_rank(e["UpgradeFingerprint"].as_str());
-            let mc = match mods.get_mut(it) {
-                Some(mc) => mc,
-                None => mods.entry(it.to_string()).or_default(),
-            };
+            let mc = blob_entry(&mut mods, it);
             *mc.by_rank.entry(rank).or_insert(0) += 1;
             mc.total += 1;
         }
@@ -1240,10 +1226,7 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
         for e in arr {
             let Some(it) = e["ItemType"].as_str() else { continue };
             if !it.starts_with("/Lotus/") { continue; }
-            match flavour_items.get_mut(it) {
-                Some(v) => *v += 1,
-                None => { flavour_items.insert(it.to_string(), 1); }
-            }
+            *blob_entry(&mut flavour_items, it) += 1;
         }
     }
 
@@ -1254,10 +1237,7 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
         for e in arr {
             let Some(it) = e["ItemType"].as_str() else { continue };
             if !it.starts_with("/Lotus/") { continue; }
-            match weapon_skins.get_mut(it) {
-                Some(v) => *v += 1,
-                None => { weapon_skins.insert(it.to_string(), 1); }
-            }
+            *blob_entry(&mut weapon_skins, it) += 1;
         }
     }
 
@@ -1296,6 +1276,19 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
         flavour_items, weapon_skins, mastery_data, pending_recipes, consumed_suits,
         rivens,
     })
+}
+
+/// Duplicate ItemTypes dominate every map the blob parse builds, so the lookup
+/// checks `get_mut` first rather than paying for `entry()`'s unconditional
+/// `to_string()` on each of the tens of thousands of repeats.
+fn blob_entry<'a, V: Default>(map: &'a mut HashMap<String, V>, key: &str) -> &'a mut V {
+    // The double lookup is what the borrow checker costs here; it is still
+    // cheaper than allocating a key per occurrence.
+    if map.contains_key(key) {
+        map.get_mut(key).expect("just checked the key is present")
+    } else {
+        map.entry(key.to_string()).or_default()
+    }
 }
 
 /// Extract the `lvl` field from a mod UpgradeFingerprint JSON string.
@@ -2091,19 +2084,15 @@ fn scan_linux_inventory_regions(
         })
         .partition(LinuxRegion::is_anonymous);
 
-    let _ = walk_regions(process, anon_regions, |_| true, deadline, |address, chunk| {
+    let mut visit = |address: usize, chunk: &[u8]| {
         t_read += last_visit.elapsed();
         let keep_going = process_chunk(address, chunk);
         last_visit = std::time::Instant::now();
         keep_going
-    });
+    };
+    let _ = walk_regions(process, anon_regions, |_| true, deadline, &mut visit);
     if !found_something.get() {
-        let _ = walk_regions(process, file_regions, |_| true, deadline, |address, chunk| {
-            t_read += last_visit.elapsed();
-            let keep_going = process_chunk(address, chunk);
-            last_visit = std::time::Instant::now();
-            keep_going
-        });
+        let _ = walk_regions(process, file_regions, |_| true, deadline, &mut visit);
     }
 
     eprintln!(
@@ -2411,10 +2400,11 @@ pub fn probe_cached_blob(_blob_tx: std::sync::mpsc::Sender<BlobInventory>) -> Sc
 // timestamp, and once the buffer is found its address caches like
 // LAST_BLOB_REGION.
 
-/// The formatted marker, sharing its wording with the file tail in
-/// `log_parser::is_inventory_sync_line`; both read the same line.
+/// The formatted marker. Shared with the file tail rather than re-spelled: a
+/// mismatch between the two readers degrades to plain interval polling, which
+/// is hard to tell from working correctly.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-const SYNC_MARKER: &[u8] = b"OnInventoryResults completed in";
+const SYNC_MARKER: &[u8] = crate::log_parser::INVENTORY_SYNC_MARKER.as_bytes();
 
 /// Present on every log line, so it identifies the buffer regardless of what
 /// the game happens to have logged recently.
@@ -3110,7 +3100,7 @@ fn find_warframe_pid() -> Option<u32> {
 
 #[cfg(test)]
 mod seed_tests {
-    use super::{enclosing_object_start, blob_seed_offsets, extract_blob_json, extract_blob_json_ref};
+    use super::{enclosing_object_start, blob_seed_offsets, extract_blob_json, extract_blob_json_at};
     use std::borrow::Cow;
 
     #[test]
@@ -3221,10 +3211,10 @@ mod seed_tests {
     #[test]
     fn blob_json_ref_borrows_in_the_common_case_and_owns_in_the_fallback() {
         let intact = br#"{"SubscribedToEmails":0,"DeathSquadable":false}"#;
-        assert!(matches!(extract_blob_json_ref(intact), Some(Cow::Borrowed(_))));
+        assert!(matches!(extract_blob_json_at(intact, intact.len()), Some(Cow::Borrowed(_))));
 
         let overwritten = br#"x"SubscribedToEmails":0,"DeathSquadable":false}"#;
-        assert!(matches!(extract_blob_json_ref(overwritten), Some(Cow::Owned(_))));
+        assert!(matches!(extract_blob_json_at(overwritten, overwritten.len()), Some(Cow::Owned(_))));
     }
 }
 
