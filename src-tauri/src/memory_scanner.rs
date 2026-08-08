@@ -1968,10 +1968,11 @@ fn scan_linux_inventory_regions(
         let is_mission = (has_prefix || start_offset.is_some())
             && MISSION_FINDER.find(chunk).is_some();
         t_search += t1.elapsed();
-        // ponytail: the chain-reconstruction below assumes every mapping in
-        // `prefix` precedes `chunk` in address order, which only holds because
-        // the caller walks regions ascending. A descending walk would need two
-        // ascending passes over a candidate list, not a `.rev()` of this one.
+        // The chain-reconstruction below assumes every mapping in `prefix`
+        // precedes `chunk` in address order, which only holds because the
+        // caller walks regions ascending. Reordering to reach the blob sooner
+        // is not worth the rework: it already turns up in the first quarter of
+        // the ascending walk, so a high-address-first pass would read *more*.
         if start_offset.is_none() && !is_mission && has_prefix {
             while prefix.iter().map(|item| item.data.len()).sum::<usize>() + read > PREFIX_BYTES
                 && !prefix.is_empty()
@@ -2090,11 +2091,11 @@ fn scan_linux_inventory_regions(
 /// Re-read the blob straight from the address the last successful scan found it
 /// at, stitching forward through following mappings until the JSON closes.
 ///
-/// The full walk reads several gigabytes to reach a blob that, in practice,
-/// sits near the very top of the address space — the last few percent of the
-/// mappings. Because the monitor rescans every 10 seconds and the game rarely
-/// moves the allocation between them, probing the remembered address first
-/// turns the common case into a few megabytes of reads.
+/// The full walk reads several gigabytes to reach the blob, which sits in the
+/// first quarter of the ascending walk — measured at 14.8%, 16.0%, 23.6% and
+/// 23.7% of mapped bytes across four core dumps of two clients. Because the
+/// game rarely moves the allocation between scans, probing the remembered
+/// address first turns the common case into a few megabytes of reads.
 ///
 /// Returns `None` whenever anything looks different from last time, which puts
 /// the caller back on the full walk rather than reporting a stale inventory.
