@@ -1334,6 +1334,19 @@ enum CachedBlobScan {
     Unchanged,
 }
 
+/// Set once the probe has reported that nothing changed, cleared as soon as
+/// anything does. Probes run every couple of seconds and nearly all of them
+/// find byte-identical JSON, so logging each one drowns out the rest of the
+/// log. Only the transition into that state is logged.
+static STEADY_STATE_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// True the first time the probe settles into "unchanged", false for every
+/// repeat until [`blob_unchanged`] sees bytes that differ.
+fn steady_state_notice_due() -> bool {
+    !STEADY_STATE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn has_cached_blob() -> bool {
     LAST_BLOB_REGION.load(std::sync::atomic::Ordering::Relaxed) != 0
 }
@@ -1343,6 +1356,7 @@ pub fn has_cached_blob() -> bool {
 pub fn reset_last_blob_region() {
     LAST_BLOB_REGION.store(0, std::sync::atomic::Ordering::Relaxed);
     LAST_BLOB_DIGEST.store(0, std::sync::atomic::Ordering::Relaxed);
+    STEADY_STATE_LOGGED.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Discard the digest baseline so the next candidate is parsed no matter what
@@ -1372,7 +1386,13 @@ fn blob_unchanged(json: &[u8]) -> bool {
     // reset_last_blob_region stores — that sentinel must always compare as
     // "changed" to force a re-parse after a PID change.
     let digest = hasher.finish() | 1;
-    LAST_BLOB_DIGEST.swap(digest, std::sync::atomic::Ordering::Relaxed) == digest
+    let unchanged = LAST_BLOB_DIGEST.swap(digest, std::sync::atomic::Ordering::Relaxed) == digest;
+    if !unchanged {
+        // Bytes moved, so the next settle into the steady state is worth
+        // saying out loud again.
+        STEADY_STATE_LOGGED.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    unchanged
 }
 
 /// Scans Warframe process memory for the FULL_ACCOUNT inventory blob and sends it
@@ -1492,7 +1512,9 @@ fn scan_windows_cached_blob(process: windows_sys::Win32::Foundation::HANDLE) -> 
     }
 
     if blob_unchanged(&stitched) {
-        eprintln!("[blob] fast-path hit at 0x{cached_addr:012x}: unchanged since last scan — skipping parse");
+        if steady_state_notice_due() {
+            eprintln!("[blob] fast-path hit at 0x{cached_addr:012x}: unchanged since last scan; quiet until it changes");
+        }
         return Some(CachedBlobScan::Unchanged);
     }
     match parse_full_account_blob(&stitched) {
@@ -2186,10 +2208,12 @@ fn scan_linux_cached_blob(
     // the digest at. A match means the previous cycle already parsed and sent
     // this exact blob — skip the rebuild of BlobInventory's HashMaps/Vecs.
     if blob_unchanged(&data) {
-        eprintln!(
-            "[blob] cached-region hit: unchanged since last scan — skipping parse (bytes={}KB stitch={:.1}ms total={:.1}ms)",
-            bytes_read / 1000, stitch_time.as_secs_f64() * 1000.0, t_total.elapsed().as_secs_f64() * 1000.0,
-        );
+        if steady_state_notice_due() {
+            eprintln!(
+                "[blob] cached-region hit: unchanged since last scan; quiet until it changes (bytes={}KB stitch={:.1}ms total={:.1}ms)",
+                bytes_read / 1000, stitch_time.as_secs_f64() * 1000.0, t_total.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
         return Some(CachedBlobScan::Unchanged);
     }
 
@@ -2513,7 +2537,7 @@ fn sync_marker_is_new(newest: Option<f64>) -> bool {
 #[cfg(target_os = "linux")]
 fn linux_newest_sync_timestamp(process: &LinuxProcess, regions: &[LinuxRegion]) -> Option<f64> {
     let mut buffer = Vec::new();
-    let mut read_region = |region: &LinuxRegion, buffer: &mut Vec<u8>| -> Option<usize> {
+    let read_region = |region: &LinuxRegion, buffer: &mut Vec<u8>| -> Option<usize> {
         buffer.resize(region.len.min(MAX_LOG_REGION), 0);
         match process.read(region.start, buffer) {
             Ok(read) if read > LOG_LINE_MARKER.len() => Some(read),
@@ -3209,7 +3233,10 @@ static BLOB_DIGEST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod blob_digest_tests {
-    use super::{blob_unchanged, forget_blob_digest, reset_last_blob_region, BLOB_DIGEST_TEST_LOCK};
+    use super::{
+        blob_unchanged, forget_blob_digest, reset_last_blob_region, steady_state_notice_due,
+        BLOB_DIGEST_TEST_LOCK,
+    };
 
     #[test]
     fn digest_tracks_changes_and_resets() {
@@ -3227,6 +3254,30 @@ mod blob_digest_tests {
 
         reset_last_blob_region();
         assert!(!blob_unchanged(&mutated), "reset forces the next call to report changed");
+    }
+
+    /// Probes run every couple of seconds and nearly all of them find the same
+    /// bytes, so the steady-state notice has to be a transition rather than a
+    /// per-probe line, otherwise it drowns out everything else in the log.
+    #[test]
+    fn the_steady_state_notice_fires_once_per_settle() {
+        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_last_blob_region();
+
+        let blob = b"{\"SubscribedToEmails\":1,\"RegularCredits\":100}".to_vec();
+        assert!(!blob_unchanged(&blob), "first sighting reports changed");
+        assert!(blob_unchanged(&blob), "second sighting is the steady state");
+        assert!(steady_state_notice_due(), "entering the steady state logs once");
+        assert!(!steady_state_notice_due(), "staying in it does not log again");
+
+        let mut mutated = blob.clone();
+        mutated[0] = b'[';
+        assert!(!blob_unchanged(&mutated), "the bytes changed");
+        assert!(blob_unchanged(&mutated), "and settled again");
+        assert!(steady_state_notice_due(), "the next settle logs again");
+
+        reset_last_blob_region();
+        assert!(steady_state_notice_due(), "a new game process starts the cycle over");
     }
 
     // Unparseable bytes that persist across scan cycles must not start
