@@ -2531,7 +2531,13 @@ fn newest_sync_timestamp(chunk: &[u8]) -> Option<f64> {
 fn sync_marker_is_new(newest: Option<f64>) -> bool {
     let Some(newest) = newest else { return false };
     let previous = f64::from_bits(LAST_SYNC_TIMESTAMP.swap(newest.to_bits(), std::sync::atomic::Ordering::Relaxed));
-    newest != previous
+    let is_new = newest != previous;
+    if is_new {
+        // Four in a 40-minute session, and the walk policy keys off them, so
+        // they are logged rather than left to be inferred from the walks.
+        eprintln!("[log] inventory sync marker at t={newest:.3}s");
+    }
+    is_new
 }
 
 /// Newest sync-marker timestamp currently in the game's log buffers, probing

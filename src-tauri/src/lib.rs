@@ -4629,39 +4629,49 @@ pub struct InventoryUpdate {
 
 /// Never walk more often than the old fixed cadence.
 const WALK_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-/// Backstop for the cases a probe cannot see: a stale address that still holds
-/// an old parseable copy answers "unchanged" forever, and a cold client may
-/// load its inventory without us ever seeing the marker that says so.
-const WALK_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// A client with no blob found yet is usually at the login screen. The marker
+/// ends that wait as soon as the inventory arrives, so this interval only
+/// applies when no marker reaches us at all.
+const WALK_COLD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Covers the state a probe cannot detect: the game reallocates the blob but
+/// the old address still holds a parseable copy of the old bytes, so every
+/// probe answers "unchanged". That is rare and a walk costs the player frames,
+/// hence the long interval.
+const WALK_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(900);
 
-/// Whether a full region walk has earned its cost this tick.
+/// Whether a full region walk is worth its cost this tick.
 ///
-/// A walk reads gigabytes and visibly costs the player frames, so the rules are
-/// about avoiding the walks that cannot pay:
+/// A walk reads gigabytes and drops the player's framerate, so most of these
+/// rules exist to skip walks that cannot find anything new. The probe covers
+/// the common cases in half a millisecond: a blob that grew in place is
+/// `Updated`, one that moved is `CacheMiss`.
 ///
-///   - A sync marker means the client really did fetch inventory, which is the
-///     one signal that resolves an ambiguous miss. Escalate at once.
-///   - A miss with a blob already known costs `WALK_MIN_INTERVAL`. The game
-///     reallocates the buffer when the inventory grows, so a miss here has a
-///     good chance of being a real change worth chasing.
-///   - A miss with *no* blob ever found is the login screen: the inventory is
-///     genuinely not in memory yet, and walking every 10 s to re-prove that is
-///     what makes the game stutter for 20 s at a time. Wait for the backstop
-///     and let the marker do the work.
+///   - `Updated` needs no walk. The new inventory is already on its way to the
+///     monitor, and any outstanding marker is explained by it.
+///   - `Unchanged` with a marker still walks. The client fetched inventory and
+///     our copy did not move, which is usually a sync carrying no delta, but it
+///     is also what a stale address holding the old bytes looks like.
+///   - A miss with no blob ever found is the login screen, where the inventory
+///     is not in memory yet. Re-checking that on a short timer is what makes
+///     the game stutter.
 ///
-/// Correctness never rests on the marker. Every case still has an interval that
-/// fires without one, so a missing EE.log or an unlocatable log buffer costs
-/// only latency.
+/// None of this depends on the marker for correctness. Every case has an
+/// interval that fires without one, so a missing EE.log or an unlocatable log
+/// buffer costs only latency.
 fn walk_is_due(
     outcome: &memory_scanner::ScanOutcome,
     sync_seen: bool,
     has_cached_blob: bool,
     since_walk: std::time::Duration,
 ) -> bool {
+    use memory_scanner::ScanOutcome;
     match outcome {
-        memory_scanner::ScanOutcome::CacheMiss if sync_seen => true,
-        memory_scanner::ScanOutcome::CacheMiss if has_cached_blob => since_walk >= WALK_MIN_INTERVAL,
-        _ => since_walk >= WALK_MAX_INTERVAL,
+        ScanOutcome::Updated => false,
+        ScanOutcome::CacheMiss if sync_seen => true,
+        ScanOutcome::CacheMiss if has_cached_blob => since_walk >= WALK_MIN_INTERVAL,
+        ScanOutcome::Unchanged if sync_seen => since_walk >= WALK_MIN_INTERVAL,
+        ScanOutcome::CacheMiss => since_walk >= WALK_COLD_INTERVAL,
+        ScanOutcome::Unchanged => since_walk >= WALK_MAX_INTERVAL,
     }
 }
 
@@ -5111,8 +5121,15 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                     // seconds; reading the log text out of the process sees it
                     // as soon as the game formats the line, and falls back to
                     // the tail when the buffers cannot be located.
-                    let sync_seen = memory_scanner::probe_inventory_sync_marker()
-                        | blob_sync_pending.load(Ordering::SeqCst);
+                    //
+                    // The memory probe reports each marker exactly once, so it
+                    // has to be folded into the held flag rather than read
+                    // beside it. Otherwise a marker arriving on a tick that
+                    // cannot act on it is lost.
+                    if memory_scanner::probe_inventory_sync_marker() {
+                        blob_sync_pending.store(true, Ordering::SeqCst);
+                    }
+                    let sync_seen = blob_sync_pending.load(Ordering::SeqCst);
                     let since_walk = last_walk_time
                         .map_or(std::time::Duration::MAX, |t: std::time::Instant| t.elapsed());
                     should_capture = walk_is_due(
@@ -5121,10 +5138,11 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                         memory_scanner::has_cached_blob(),
                         since_walk,
                     );
-                    // Hold the marker when it was neither acted on nor answered:
-                    // a miss the rate limit turned down is the one case where it
-                    // still has work to do on a later tick.
-                    if should_capture || outcome != memory_scanner::ScanOutcome::CacheMiss {
+                    // Hold the marker unless it was acted on, or the probe
+                    // already delivered the inventory it was announcing. A
+                    // marker dropped while the rate limit says "not yet" is
+                    // never revisited.
+                    if should_capture || outcome == memory_scanner::ScanOutcome::Updated {
                         blob_sync_pending.store(false, Ordering::SeqCst);
                     }
                     if should_capture {
@@ -9114,7 +9132,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod walk_policy_tests {
-    use super::{walk_is_due, WALK_MAX_INTERVAL, WALK_MIN_INTERVAL};
+    use super::{walk_is_due, WALK_COLD_INTERVAL, WALK_MAX_INTERVAL, WALK_MIN_INTERVAL};
     use crate::memory_scanner::ScanOutcome;
     use std::time::Duration;
 
@@ -9125,33 +9143,50 @@ mod walk_policy_tests {
     fn a_client_with_no_blob_yet_waits_for_the_backstop() {
         let just_walked = WALK_MIN_INTERVAL + Duration::from_secs(1);
         assert!(!walk_is_due(&ScanOutcome::CacheMiss, false, false, just_walked));
-        assert!(walk_is_due(&ScanOutcome::CacheMiss, false, false, WALK_MAX_INTERVAL));
+        assert!(walk_is_due(&ScanOutcome::CacheMiss, false, false, WALK_COLD_INTERVAL));
+    }
+
+    /// A settled inventory answers "unchanged" every couple of seconds for as
+    /// long as the player stays docked, so walking gigabytes each minute to
+    /// check it again is wasted work.
+    #[test]
+    fn a_settled_inventory_does_not_walk_on_the_minute() {
+        assert!(!walk_is_due(&ScanOutcome::Unchanged, false, true, Duration::from_secs(60)));
+        assert!(!walk_is_due(&ScanOutcome::Unchanged, false, true, Duration::from_secs(300)));
+        assert!(walk_is_due(&ScanOutcome::Unchanged, false, true, WALK_MAX_INTERVAL));
+    }
+
+    /// The client announced a fetch and our copy did not move. Usually a sync
+    /// with no delta, but it is also what a stale address holding the old bytes
+    /// looks like, which the probe cannot distinguish.
+    #[test]
+    fn an_unchanged_probe_with_a_marker_still_walks() {
+        assert!(walk_is_due(&ScanOutcome::Unchanged, true, true, WALK_MIN_INTERVAL));
+        assert!(!walk_is_due(&ScanOutcome::Unchanged, true, true, Duration::from_secs(3)));
+    }
+
+    /// The probe already delivered the new inventory, so a walk would read
+    /// gigabytes to produce what the monitor already has.
+    #[test]
+    fn a_fresh_parse_never_escalates() {
+        assert!(!walk_is_due(&ScanOutcome::Updated, true, true, Duration::MAX));
     }
 
     /// Once a blob is known, a miss plausibly means the game reallocated it
-    /// because the inventory changed — worth chasing at the old cadence.
+    /// because the inventory changed, which is worth checking at the old
+    /// cadence.
     #[test]
     fn a_miss_on_a_known_blob_keeps_the_old_cadence() {
         assert!(walk_is_due(&ScanOutcome::CacheMiss, false, true, WALK_MIN_INTERVAL));
         assert!(!walk_is_due(&ScanOutcome::CacheMiss, false, true, Duration::from_secs(4)));
     }
 
-    /// The marker resolves the ambiguity outright, including at the login
-    /// screen, where the first sync arrives.
+    /// The marker resolves the ambiguity, including at the login screen where
+    /// the first sync arrives.
     #[test]
     fn a_sync_marker_escalates_immediately() {
         assert!(walk_is_due(&ScanOutcome::CacheMiss, true, false, Duration::ZERO));
         assert!(walk_is_due(&ScanOutcome::CacheMiss, true, true, Duration::ZERO));
-    }
-
-    /// A probe that answered definitively has nothing to escalate, but a stale
-    /// address holding an old parseable copy answers "unchanged" forever, so
-    /// the backstop still has to fire.
-    #[test]
-    fn a_definitive_probe_only_walks_on_the_backstop() {
-        assert!(!walk_is_due(&ScanOutcome::Unchanged, false, true, WALK_MIN_INTERVAL));
-        assert!(!walk_is_due(&ScanOutcome::Updated, true, true, WALK_MIN_INTERVAL));
-        assert!(walk_is_due(&ScanOutcome::Unchanged, false, true, WALK_MAX_INTERVAL));
     }
 
     /// The first tick after the game appears has no previous walk to rate-limit
