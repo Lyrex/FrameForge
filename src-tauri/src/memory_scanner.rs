@@ -1373,8 +1373,15 @@ fn forget_blob_digest() {
 /// Returns true when `json` is byte-identical to what the previous call saw.
 fn blob_unchanged(json: &[u8]) -> bool {
     use std::hash::{DefaultHasher, Hash, Hasher};
+    // Callers hand over a stitched buffer, not a trimmed blob. The stitch stops
+    // at the mapping that closes the JSON, so everything past the closing brace
+    // is whatever heap shared that mapping, tens of megabytes of it, rewritten
+    // constantly by a running client. Hash that tail and the digest never
+    // matches, so every probe reparses and the skip never happens. Bytes with no
+    // blob end are hashed whole; they only need to compare equal to themselves.
+    let blob = &json[..find_blob_end(json).unwrap_or(json.len())];
     let mut hasher = DefaultHasher::new();
-    json.hash(&mut hasher);
+    blob.hash(&mut hasher);
     // OR in a set bit so a hashed digest can never equal the 0 sentinel that
     // reset_last_blob_region stores — that sentinel must always compare as
     // "changed" to force a re-parse after a PID change.
@@ -3196,17 +3203,30 @@ mod seed_tests {
 #[cfg(test)]
 static BLOB_DIGEST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Take the lock and clear the statics, so each test starts from a known
+/// baseline instead of inheriting whatever the previous holder left behind.
+///
+/// The reset has to happen on entry, not on exit. The digest covers only the
+/// blob's JSON, so two tests built on the same fixture produce the same digest,
+/// and one of them would otherwise see its "first" sighting reported as
+/// unchanged.
+#[cfg(test)]
+fn blob_digest_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    let guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset_last_blob_region();
+    guard
+}
+
 #[cfg(test)]
 mod blob_digest_tests {
     use super::{
-        blob_unchanged, forget_blob_digest, reset_last_blob_region, steady_state_notice_due,
-        BLOB_DIGEST_TEST_LOCK,
+        blob_digest_test_guard, blob_unchanged, forget_blob_digest, reset_last_blob_region,
+        steady_state_notice_due,
     };
 
     #[test]
     fn digest_tracks_changes_and_resets() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_last_blob_region();
+        let _digest_guard = blob_digest_test_guard();
 
         let blob = b"{\"SubscribedToEmails\":1,\"RegularCredits\":100}".to_vec();
         assert!(!blob_unchanged(&blob), "first call always reports changed");
@@ -3221,13 +3241,30 @@ mod blob_digest_tests {
         assert!(!blob_unchanged(&mutated), "reset forces the next call to report changed");
     }
 
+    /// The probe stitches whole mappings, so the blob arrives with a tail of
+    /// unrelated heap that a running client rewrites between probes. Digesting
+    /// that tail is indistinguishable from the inventory itself changing, which
+    /// reparses and re-emits a settled inventory on every probe.
+    #[test]
+    fn a_rewritten_tail_after_the_blob_is_not_a_change() {
+        let _digest_guard = blob_digest_test_guard();
+
+        let blob = br#"{"SubscribedToEmails":1,"DeathSquadable":false}"#;
+        let mut first = blob.to_vec();
+        first.extend_from_slice(b"\x00\x11garbage from a neighbouring allocation");
+        let mut second = blob.to_vec();
+        second.extend_from_slice(b"\xff\xfe an entirely different neighbour, and longer");
+
+        assert!(!blob_unchanged(&first), "first sighting reports changed");
+        assert!(blob_unchanged(&second), "same blob, different tail, is unchanged");
+    }
+
     /// Probes run every couple of seconds and nearly all of them find the same
     /// bytes, so the steady-state notice has to be a transition rather than a
     /// per-probe line, otherwise it drowns out everything else in the log.
     #[test]
     fn the_steady_state_notice_fires_once_per_settle() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_last_blob_region();
+        let _digest_guard = blob_digest_test_guard();
 
         let blob = b"{\"SubscribedToEmails\":1,\"RegularCredits\":100}".to_vec();
         assert!(!blob_unchanged(&blob), "first sighting reports changed");
@@ -3250,8 +3287,7 @@ mod blob_digest_tests {
     // this", which would wedge the walk on a region that never parsed.
     #[test]
     fn forgetting_after_a_failed_parse_forces_a_retry() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_last_blob_region();
+        let _digest_guard = blob_digest_test_guard();
 
         let garbage = b"{\"MiscItems\":[ truncated".to_vec();
         assert!(!blob_unchanged(&garbage), "first sighting reports changed");
@@ -3441,7 +3477,7 @@ mod linux_tests {
     /// channel.
     #[test]
     fn probe_outcomes_distinguish_fresh_unchanged_and_miss() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _digest_guard = blob_digest_test_guard();
         let mut data = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#.to_vec();
         data.resize(64_000, b' ');
         data.extend_from_slice(br#""DeathSquadable":false}"#);
@@ -3484,7 +3520,7 @@ mod linux_tests {
 
     #[test]
     fn linux_cached_blob_is_reread_and_rejected_when_stale() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _digest_guard = blob_digest_test_guard();
         // Blobs under 50 KB are rejected as coincidental fragments, so the
         // fixture pads the object out to a realistic size.
         let mut data = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#.to_vec();
@@ -3516,7 +3552,7 @@ mod linux_tests {
     /// boundary is still seen once the rest of it arrives in the next read.
     #[test]
     fn linux_cached_blob_finds_end_marker_split_across_mapping_boundary() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _digest_guard = blob_digest_test_guard();
         let marker = b"\"DeathSquadable\":";
         let (marker_head, marker_tail) = marker.split_at(7);
 
@@ -3547,7 +3583,7 @@ mod linux_tests {
 
     #[test]
     fn linux_cached_blob_keeps_stitching_when_end_brace_lands_in_next_mapping() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _digest_guard = blob_digest_test_guard();
         let marker = br#""DeathSquadable":"#;
 
         let mut first = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#.to_vec();
@@ -3577,7 +3613,7 @@ mod linux_tests {
 
     #[test]
     fn linux_cached_blob_skips_reparse_when_bytes_are_unchanged() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _digest_guard = blob_digest_test_guard();
         let mut data = br#"{"SubscribedToEmails":true,"RegularCredits":99,"MiscItems":[],"#.to_vec();
         data.resize(64_000, b' ');
         data.extend_from_slice(br#""DeathSquadable":false}"#);
@@ -3641,8 +3677,7 @@ mod linux_tests {
 
     #[test]
     fn linux_inventory_scan_reports_unchanged_instead_of_reparsing() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_last_blob_region();
+        let _digest_guard = blob_digest_test_guard();
 
         let mut mapping = br#"{"SubscribedToEmails":true,"RegularCredits":7,"MiscItems":[],"#.to_vec();
         mapping.resize(64_000, b' ');
@@ -3678,8 +3713,7 @@ mod linux_tests {
     /// anonymous-only pass 1 comes up empty.
     #[test]
     fn linux_inventory_scan_finds_blob_via_file_backed_fallback() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_last_blob_region();
+        let _digest_guard = blob_digest_test_guard();
 
         let mut blob = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#.to_vec();
         blob.resize(64_000, b' ');
@@ -3714,8 +3748,7 @@ mod linux_tests {
     /// just "not returned", genuinely untouched.
     #[test]
     fn linux_inventory_scan_skips_file_backed_tier_when_anonymous_pass_finds_a_blob() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_last_blob_region();
+        let _digest_guard = blob_digest_test_guard();
 
         let mut anon_blob = br#"{"SubscribedToEmails":true,"RegularCredits":1,"MiscItems":[],"#.to_vec();
         anon_blob.resize(64_000, b' ');
@@ -3760,8 +3793,7 @@ mod linux_tests {
 
     #[test]
     fn linux_inventory_scan_stitches_and_parses_regions() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_last_blob_region();
+        let _digest_guard = blob_digest_test_guard();
         let first_json = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#;
         let second_json = br#""DeathSquadable":false}"#;
         let mut first = first_json.to_vec();
@@ -3796,8 +3828,7 @@ mod linux_tests {
     /// ("expected value at line 1 column 9") and lost the inventory entirely.
     #[test]
     fn linux_inventory_scan_seeds_at_the_blob_not_at_earlier_json() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_last_blob_region();
+        let _digest_guard = blob_digest_test_guard();
         // Qualifies for the prefix buffer: Lotus path, no start marker, no
         // mission delta — and opens a JSON object of its own.
         let mut prefix = br#"{"Mods":garbage/Lotus/Weapons/Tenno/Rifle "#.to_vec();
@@ -3834,8 +3865,7 @@ mod linux_tests {
     /// still reject it rather than mistaking the prefix hit for a real seed.
     #[test]
     fn linux_inventory_scan_rejects_mission_delta_without_start_marker() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_last_blob_region();
+        let _digest_guard = blob_digest_test_guard();
 
         let mut mission = br#"{"InventoryChanges":{"MiscItems":[{"ItemType":"/Lotus/Types/Items/x"}]}"#.to_vec();
         mission.resize(128_000, b' ');
@@ -3862,8 +3892,7 @@ mod linux_tests {
     /// two-mapping gap, so a filler mapping is required to expose the loss.
     #[test]
     fn linux_inventory_scan_completes_when_marker_flush_at_mapping_edge() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_last_blob_region();
+        let _digest_guard = blob_digest_test_guard();
 
         let marker = b"\"DeathSquadable\":";
 
@@ -3909,8 +3938,7 @@ mod linux_tests {
 
     #[test]
     fn linux_inventory_scan_finishes_before_rejecting_large_mapping() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_last_blob_region();
+        let _digest_guard = blob_digest_test_guard();
         let first_json = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#;
         let second_json = br#""DeathSquadable":false}"#;
         let mut first = first_json.to_vec();
@@ -3940,8 +3968,7 @@ mod linux_tests {
 
     #[test]
     fn linux_inventory_scan_finds_blob_past_first_chunk_boundary() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_last_blob_region();
+        let _digest_guard = blob_digest_test_guard();
 
         let mut blob = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#.to_vec();
         blob.resize(64_000, b' ');
@@ -3978,8 +4005,7 @@ mod linux_tests {
     /// so the seed opened in chunk A must be stitched to chunk B to parse.
     #[test]
     fn linux_inventory_scan_finds_blob_straddling_chunk_boundary() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_last_blob_region();
+        let _digest_guard = blob_digest_test_guard();
 
         let mut blob = br#"{"SubscribedToEmails":true,"RegularCredits":42,"MiscItems":[],"#.to_vec();
         blob.resize(64_000, b' ');
@@ -4014,8 +4040,7 @@ mod linux_tests {
 
     #[test]
     fn linux_inventory_scan_recovers_fields_before_start_marker() {
-        let _digest_guard = BLOB_DIGEST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_last_blob_region();
+        let _digest_guard = blob_digest_test_guard();
         let prefix =
             br#"{"RegularCredits":42,"MiscItems":[{"ItemType":"/Lotus/Test","ItemCount":1}],"#;
         let suffix = br#""SubscribedToEmails":true,"DeathSquadable":false}"#;
